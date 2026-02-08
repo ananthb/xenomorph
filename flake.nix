@@ -128,6 +128,42 @@
 
             dontInstall = true;
           };
+
+          # QEMU integration test (requires KVM)
+          qemu-integration = pkgs.stdenv.mkDerivation {
+            pname = "xenomorph-qemu-integration";
+            inherit version;
+            src = ./.;
+
+            nativeBuildInputs = [
+              pkgs.zig
+              pkgs.qemu_kvm
+              pkgs.cpio
+              pkgs.gzip
+            ];
+
+            dontConfigure = true;
+            dontInstall = true;
+
+            # Require KVM for this test
+            requiredSystemFeatures = [ "kvm" ];
+
+            buildPhase = ''
+              export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
+
+              # Set up environment for the test
+              export KERNEL_PATH="${pkgs.linuxPackages_latest.kernel}/bzImage"
+              export BUSYBOX_PATH="${pkgs.pkgsStatic.busybox}/bin/busybox"
+              export QEMU_PATH="${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
+              export XENOMORPH_PATH="${xenomorphStatic}/bin/xenomorph"
+
+              # Build and run the QEMU test
+              zig build test-qemu -Doptimize=ReleaseSafe
+              ./zig-out/bin/qemu-test
+
+              touch $out
+            '';
+          };
         };
 
         # QEMU integration test
@@ -143,6 +179,9 @@
 
           export KERNEL_PATH BUSYBOX_PATH XENOMORPH_PATH QEMU_PATH
 
+          # Set up Zig cache directory
+          export ZIG_GLOBAL_CACHE_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/zig"
+
           # Build and run the QEMU test executable
           ${pkgs.zig}/bin/zig build test-qemu -Doptimize=ReleaseSafe
           ./zig-out/bin/qemu-test
@@ -157,9 +196,14 @@
             busybox
             cpio
             gzip
+            # Ensure proper less is available (busybox's less breaks git pager)
+            less
           ];
 
           shellHook = ''
+            # Use real less instead of busybox's (fixes git pager)
+            export PAGER="${pkgs.less}/bin/less"
+
             echo "Xenomorph development environment"
             echo "Zig version: $(zig version)"
             echo ""
@@ -176,6 +220,8 @@
         builds = {
           exclude = [ "aarch64-darwin" "x86_64-darwin" ];
         };
+        # Enable KVM for QEMU integration tests
+        server.enable = true;
       };
     };
 }
