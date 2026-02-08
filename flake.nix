@@ -218,7 +218,8 @@
       # Garnix-specific configuration
       garnix = {
         builds = {
-          exclude = [ "aarch64-darwin" "x86_64-darwin" ];
+          # Only build for x86_64-linux (aarch64-linux lacks native runners)
+          exclude = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" ];
         };
         # Enable KVM for QEMU integration tests
         server.enable = true;
