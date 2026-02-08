@@ -4,6 +4,7 @@ const std = @import("std");
 pub const log = @import("util/log.zig");
 pub const syscall = @import("util/syscall.zig");
 pub const mount = @import("util/mount.zig");
+pub const memory = @import("util/memory.zig");
 
 // Pivot modules
 pub const pivot_mounts = @import("pivot/mounts.zig");
@@ -36,7 +37,6 @@ pub const process_terminator = @import("process/terminator.zig");
 pub const process_essential = @import("process/essential.zig");
 pub const process_namespace = @import("process/namespace.zig");
 
-// Configuration
 pub const config = @import("config.zig");
 
 const scoped_log = log.scoped("main");
@@ -55,18 +55,15 @@ pub fn main() !void {
         return;
     };
 
-    // Set log level
     if (cfg.verbose) {
         log.setLevel(.debug);
     }
 
-    // Validate configuration
     config.validate(&cfg) catch |err| {
         std.debug.print("Configuration error: {}\n", .{err});
         std.process.exit(1);
     };
 
-    // Run the pivot operation
     runPivot(allocator, &cfg) catch |err| {
         scoped_log.err("Pivot failed: {}", .{err});
         std.process.exit(1);
@@ -77,19 +74,16 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     scoped_log.info("Starting xenomorph pivot", .{});
     scoped_log.info("Image: {s}", .{cfg.image});
 
-    // Check if running as root
     if (std.os.linux.getuid() != 0) {
         scoped_log.err("Must run as root", .{});
         return error.PermissionDenied;
     }
 
-    // Dry run mode
     if (cfg.dry_run) {
         try dryRun(allocator, cfg);
         return;
     }
 
-    // Confirmation prompt
     if (!cfg.force) {
         const confirmed = try confirmPivot();
         if (!confirmed) {
@@ -98,24 +92,30 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         }
     }
 
-    // Step 1: Build rootfs from image
-    scoped_log.info("Building rootfs from image", .{});
+    scoped_log.info("Building rootfs from image (in-memory)", .{});
     var builder = rootfs_builder.RootfsBuilder.init(allocator);
-    const build_result = try builder.buildFromImage(cfg.image, .{
+    var build_result = builder.buildFromImage(cfg.image, .{
         .target_dir = cfg.work_dir,
         .skip_verify = cfg.skip_verify,
-    });
-    defer {
-        var result = build_result;
-        result.deinit(allocator);
-    }
+    }) catch |err| {
+        if (err == error.InsufficientMemory) {
+            scoped_log.err("Insufficient memory for in-memory rootfs", .{});
+            scoped_log.err("The rootfs must fit entirely in RAM. Try:", .{});
+            scoped_log.err("  - Using a smaller image", .{});
+            scoped_log.err("  - Freeing up memory (stop services, clear caches)", .{});
+            scoped_log.err("  - Adding more RAM to the system", .{});
+            return error.InsufficientMemory;
+        }
+        return err;
+    };
+    defer build_result.deinit(allocator);
+    errdefer build_result.unmountTmpfs();
 
     scoped_log.info("Rootfs built: {} layers, {} bytes", .{
         build_result.layer_count,
         build_result.total_size,
     });
 
-    // Step 2: Verify rootfs
     if (!cfg.skip_verify) {
         scoped_log.info("Verifying rootfs", .{});
         var verify_result = try rootfs_verify.verify(cfg.work_dir, allocator);
@@ -130,7 +130,6 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         }
     }
 
-    // Step 3: Init system coordination
     if (!cfg.no_init_coord and !init_interface.shouldSkipCoordination()) {
         scoped_log.info("Coordinating with init system", .{});
 
@@ -151,7 +150,6 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         }
     }
 
-    // Step 4: Stop remaining processes
     scoped_log.info("Terminating non-essential processes", .{});
     if (process_terminator.terminateAll(allocator, .{
         .graceful_timeout_ms = cfg.timeout * 1000,
@@ -166,16 +164,14 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         scoped_log.warn("Process termination failed: {}", .{err});
     }
 
-    // Step 5: Prepare for pivot
     scoped_log.info("Preparing pivot", .{});
     var prep_result = try pivot_prepare.prepare(.{
         .new_root = cfg.work_dir,
         .skip_verify = true, // Already verified
-        .create_namespace = true,
+        .create_namespace = !cfg.skip_namespace,
     }, allocator);
     defer prep_result.deinit();
 
-    // Step 6: Execute pivot
     scoped_log.info("Executing pivot_root", .{});
     try pivot.executePivot(.{
         .new_root = cfg.work_dir,
@@ -251,6 +247,7 @@ test "all modules compile" {
     _ = log;
     _ = syscall;
     _ = mount;
+    _ = memory;
     _ = pivot_mounts;
     _ = pivot;
     _ = pivot_prepare;

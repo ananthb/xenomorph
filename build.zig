@@ -57,4 +57,24 @@ pub fn build(b: *std.Build) void {
 
     const integration_test_step = b.step("test-integration", "Run integration tests (requires root)");
     integration_test_step.dependOn(&run_integration_tests.step);
+
+    // QEMU integration test executable
+    const qemu_test_exe = b.addExecutable(.{
+        .name = "qemu-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration/qemu_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    b.installArtifact(qemu_test_exe);
+
+    // Run QEMU test
+    const run_qemu_test = b.addRunArtifact(qemu_test_exe);
+    run_qemu_test.step.dependOn(b.getInstallStep());
+
+    const qemu_test_step = b.step("test-qemu", "Run QEMU integration test (requires kernel, busybox, qemu)");
+    qemu_test_step.dependOn(&run_qemu_test.step);
 }

@@ -38,6 +38,9 @@ pub const Config = struct {
     /// Skip rootfs verification
     skip_verify: bool = false,
 
+    /// Skip mount namespace creation (for testing)
+    skip_namespace: bool = false,
+
     /// Cache directory for OCI layers
     cache_dir: []const u8 = "/var/cache/xenomorph",
 
@@ -116,6 +119,8 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
             cfg.no_keep_old_root = true;
         } else if (std.mem.eql(u8, arg, "--skip-verify")) {
             cfg.skip_verify = true;
+        } else if (std.mem.eql(u8, arg, "--skip-namespace")) {
+            cfg.skip_namespace = true;
         } else if (std.mem.eql(u8, arg, "--cache-dir")) {
             cfg.cache_dir = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--work-dir")) {

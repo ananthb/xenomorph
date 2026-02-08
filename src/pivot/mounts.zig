@@ -148,12 +148,24 @@ pub fn cleanupOldRoot(old_root: []const u8, allocator: std.mem.Allocator) !void 
 pub fn prepareNewRoot(new_root: []const u8, allocator: std.mem.Allocator) ![]const u8 {
     scoped_log.info("Preparing new root at {s}", .{new_root});
 
-    // Ensure new_root is a mount point
+    // Check if it's already a mount point
     const is_mount = try mount_util.isMountPoint(new_root, allocator);
-    if (!is_mount) {
-        scoped_log.debug("{s} is not a mount point, bind mounting to itself", .{new_root});
-        try mount_util.ensureMountPoint(new_root);
-    }
+    scoped_log.debug("{s} is mount point: {}", .{ new_root, is_mount });
+
+    // Always bind mount to itself to ensure it's a proper mount point for pivot_root
+    // This is necessary even if it already appears in /proc/mounts because
+    // pivot_root has strict requirements about mount point identity
+    scoped_log.debug("Bind mounting {s} to itself", .{new_root});
+    mount_util.ensureMountPoint(new_root) catch |err| {
+        // If bind mount fails because it's already a mount, that's OK
+        scoped_log.debug("Bind mount result: {}", .{err});
+    };
+
+    // Also make the new root private to prevent propagation issues with pivot_root
+    scoped_log.debug("Making new root private", .{});
+    mount_util.makePrivate(new_root) catch |err| {
+        scoped_log.debug("makePrivate result: {}", .{err});
+    };
 
     return try allocator.dupe(u8, new_root);
 }

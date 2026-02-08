@@ -1,8 +1,8 @@
 # xenomorph
 
-`pivot_root` a running Linux userland into a new rootfs.
-Keeps the old root around for inspection and modification.
-New rootfs supplied via OCI images.
+`xenomorph` `pivot_root`s a running Linux userland into a new in-memory rootfs.
+It keeps the old root mountpoint around for inspection and modification.
+The new rootfs can be an OCI image or a tarball.
 
 ## Installation
 

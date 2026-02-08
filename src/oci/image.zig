@@ -267,13 +267,22 @@ pub const ImageReference = struct {
     }
 };
 
-/// Check if a path is a local OCI layout or tarball
+/// Check if a path is a local OCI layout, tarball, or directory
 pub fn isLocalImage(path: []const u8) bool {
     // Check for tarball
     if (std.mem.endsWith(u8, path, ".tar") or
         std.mem.endsWith(u8, path, ".tar.gz") or
         std.mem.endsWith(u8, path, ".tgz"))
     {
+        return true;
+    }
+
+    // Check if it starts with / (absolute path) or ./ (relative path)
+    // This indicates it's a local path rather than an image reference
+    if (std.mem.startsWith(u8, path, "/") or std.mem.startsWith(u8, path, "./")) {
+        // Verify it's actually a directory
+        var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+        dir.close();
         return true;
     }
 

@@ -35,7 +35,7 @@
           meta = with pkgs.lib; {
             description = "Linux pivot_root tool for OCI images";
             homepage = "https://github.com/ananth/xenomorph";
-            license = licenses.mit;
+            license = licenses.gpl3Only;
             platforms = platforms.linux;
             mainProgram = "xenomorph";
           };
@@ -59,6 +59,27 @@
           installPhase = ''
             mkdir -p $out
             tar -czvf $out/xenomorph-${version}-${system}.tar.gz xenomorph-${version}
+          '';
+        };
+
+        # Static xenomorph build for QEMU testing (uses musl for static linking)
+        xenomorphStatic = pkgs.stdenv.mkDerivation {
+          pname = "xenomorph-static";
+          inherit version;
+          src = ./.;
+
+          nativeBuildInputs = [ pkgs.zig ];
+
+          dontConfigure = true;
+          dontInstall = true;
+
+          buildPhase = ''
+            runHook preBuild
+
+            export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
+            zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix $out
+
+            runHook postBuild
           '';
         };
 
@@ -109,15 +130,43 @@
           };
         };
 
+        # QEMU integration test
+        packages.qemu-test = pkgs.writeShellScriptBin "xenomorph-qemu-test" ''
+          set -e
+
+          KERNEL_PATH="${pkgs.linuxPackages_latest.kernel}/bzImage"
+          BUSYBOX_PATH="${pkgs.pkgsStatic.busybox}/bin/busybox"
+          QEMU_PATH="${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
+
+          # Use the statically-linked xenomorph for QEMU testing
+          XENOMORPH_PATH="${xenomorphStatic}/bin/xenomorph"
+
+          export KERNEL_PATH BUSYBOX_PATH XENOMORPH_PATH QEMU_PATH
+
+          # Build and run the QEMU test executable
+          ${pkgs.zig}/bin/zig build test-qemu -Doptimize=ReleaseSafe
+          ./zig-out/bin/qemu-test
+        '';
+
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             zig
             zls
+            # For QEMU integration tests
+            qemu_kvm
+            busybox
+            cpio
+            gzip
           ];
 
           shellHook = ''
             echo "Xenomorph development environment"
             echo "Zig version: $(zig version)"
+            echo ""
+            echo "To run QEMU integration test:"
+            echo "  nix run .#qemu-test"
+            echo "  # or manually:"
+            echo "  KERNEL_PATH=/path/to/bzImage BUSYBOX_PATH=${pkgs.pkgsStatic.busybox}/bin/busybox zig build test-qemu && ./zig-out/bin/qemu-test"
           '';
         };
       }

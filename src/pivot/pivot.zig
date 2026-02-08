@@ -59,39 +59,103 @@ pub fn executePivot(config: PivotConfig) PivotError!void {
 
     scoped_log.debug("Old root will be at {s}", .{old_root_path});
 
-    // Ensure old root mount point exists
-    std.fs.makeDirAbsolute(old_root_path) catch |err| {
-        if (err != error.PathAlreadyExists) {
-            scoped_log.err("Cannot create old root mount point: {}", .{err});
-            return error.OldRootCreationFailed;
-        }
-    };
+    // Ensure old root mount point exists (including parent directories)
+    // Open the new root directory and create the path relative to it
+    {
+        var new_root_dir = std.fs.openDirAbsolute(config.new_root, .{}) catch |err| {
+            scoped_log.err("Cannot open new root {s}: {}", .{ config.new_root, err });
+            return error.NewRootNotFound;
+        };
+        defer new_root_dir.close();
 
-    // Prepare null-terminated paths for syscalls
+        // makePath creates all parent directories as needed
+        new_root_dir.makePath(config.old_root_mount) catch |err| {
+            scoped_log.err("Cannot create old root mount point {s}: {}", .{ config.old_root_mount, err });
+            return error.OldRootCreationFailed;
+        };
+    }
+
+    scoped_log.debug("Created old root mount point", .{});
+
+    // Prepare null-terminated path for new_root
     var new_root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var old_root_rel_buf: [std.fs.max_path_bytes]u8 = undefined;
 
     if (config.new_root.len >= new_root_buf.len) {
-        return error.PathTooLong;
-    }
-    if (config.old_root_mount.len >= old_root_rel_buf.len) {
         return error.PathTooLong;
     }
 
     @memcpy(new_root_buf[0..config.new_root.len], config.new_root);
     new_root_buf[config.new_root.len] = 0;
 
-    @memcpy(old_root_rel_buf[0..config.old_root_mount.len], config.old_root_mount);
-    old_root_rel_buf[config.old_root_mount.len] = 0;
-
     const new_root_z: [*:0]const u8 = @ptrCast(new_root_buf[0..config.new_root.len :0]);
-    const old_root_rel_z: [*:0]const u8 = @ptrCast(old_root_rel_buf[0..config.old_root_mount.len :0]);
 
-    // Execute pivot_root
-    scoped_log.info("Executing pivot_root({s}, {s})", .{ config.new_root, config.old_root_mount });
-    syscall.pivotRoot(new_root_z, old_root_rel_z) catch |err| {
-        scoped_log.err("pivot_root failed: {}", .{err});
-        return error.PivotRootFailed;
+    // Make mounts private to avoid propagation issues
+    scoped_log.debug("Making root mount private", .{});
+    mount_util.makePrivate("/") catch |err| {
+        scoped_log.warn("Failed to make root private: {}, continuing anyway", .{err});
+    };
+
+    // Make new root private too
+    mount_util.makePrivate(config.new_root) catch |err| {
+        scoped_log.warn("Failed to make new root private: {}, continuing anyway", .{err});
+    };
+
+    // Build absolute path for put_old (pivot_root requires put_old under new_root)
+    const put_old_abs_path = std.fs.path.join(config.allocator, &.{ config.new_root, config.old_root_mount }) catch {
+        return error.AllocationFailed;
+    };
+    defer config.allocator.free(put_old_abs_path);
+
+    var put_old_abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (put_old_abs_path.len >= put_old_abs_buf.len) {
+        return error.PathTooLong;
+    }
+    @memcpy(put_old_abs_buf[0..put_old_abs_path.len], put_old_abs_path);
+    put_old_abs_buf[put_old_abs_path.len] = 0;
+    const put_old_z: [*:0]const u8 = @ptrCast(put_old_abs_buf[0..put_old_abs_path.len :0]);
+
+    // First try pivot_root
+    scoped_log.info("Trying pivot_root({s}, {s})", .{ config.new_root, put_old_abs_path });
+    syscall.pivotRoot(new_root_z, put_old_z) catch |pivot_err| {
+        scoped_log.warn("pivot_root failed: {}, trying switch_root approach", .{pivot_err});
+
+        // Fallback to switch_root approach (for initramfs/rootfs)
+        // This is similar to what busybox's switch_root does
+        scoped_log.info("Using switch_root approach (chdir + mount move + chroot)", .{});
+
+        // 1. Change to new root
+        syscall.chdir(new_root_z) catch |err| {
+            scoped_log.err("chdir to new root failed: {}", .{err});
+            return error.ChdirFailed;
+        };
+
+        // 2. Move mount to / (overmount)
+        scoped_log.debug("Moving mount to /", .{});
+        syscall.mount(".", "/", null, .{ .move = true }, null) catch |err| {
+            scoped_log.err("mount move failed: {}", .{err});
+            return error.PivotRootFailed;
+        };
+
+        // 3. Chroot to the new root
+        scoped_log.debug("Chroot to new root", .{});
+        syscall.chroot(".") catch |err| {
+            scoped_log.err("chroot failed: {}", .{err});
+            return error.ChrootFailed;
+        };
+
+        // 4. Change to / after chroot
+        syscall.chdir("/") catch |err| {
+            scoped_log.err("chdir to / after chroot failed: {}", .{err});
+            return error.ChdirFailed;
+        };
+
+        scoped_log.info("switch_root complete", .{});
+
+        // Execute post-pivot command if specified (same as pivot_root path)
+        if (config.exec_cmd) |cmd| {
+            try execCommand(cmd, config.exec_args);
+        }
+        return;
     };
 
     // Change to new root

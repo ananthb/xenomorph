@@ -1,5 +1,6 @@
 const std = @import("std");
 const log = @import("../util/log.zig");
+const memory = @import("../util/memory.zig");
 const oci_image = @import("../oci/image.zig");
 const oci_layer = @import("../oci/layer.zig");
 const oci_registry = @import("../oci/registry.zig");
@@ -16,11 +17,13 @@ pub const BuildError = error{
     IoError,
     OutOfMemory,
     VerificationFailed,
+    InsufficientMemory,
+    TmpfsMountFailed,
 };
 
 /// Options for building a rootfs
 pub const BuildOptions = struct {
-    /// Target directory for the rootfs
+    /// Target directory for the rootfs (used as mount point for tmpfs)
     target_dir: []const u8,
 
     /// Use cache for layers
@@ -31,11 +34,14 @@ pub const BuildOptions = struct {
 
     /// Skip rootfs verification
     skip_verify: bool = false,
+
+    /// Extra headroom multiplier for tmpfs size (e.g., 1.5 = 50% extra)
+    tmpfs_headroom: f64 = 1.5,
 };
 
 /// Build result
 pub const BuildResult = struct {
-    /// Path to the built rootfs
+    /// Path to the built rootfs (in-memory tmpfs)
     rootfs_path: []const u8,
 
     /// Number of layers extracted
@@ -46,6 +52,9 @@ pub const BuildResult = struct {
 
     /// Image configuration
     config: ?ImageConfig,
+
+    /// Tmpfs mount - caller must keep this alive until after pivot
+    tmpfs_mount: memory.TmpfsMount,
 
     pub const ImageConfig = struct {
         entrypoint: ?[]const []const u8,
@@ -71,6 +80,13 @@ pub const BuildResult = struct {
             }
             if (cfg.working_dir) |wd| allocator.free(wd);
         }
+        // Note: tmpfs_mount is intentionally NOT unmounted here
+        // The caller is responsible for keeping it alive during pivot
+    }
+
+    /// Explicitly unmount tmpfs (call after pivot is complete or on error)
+    pub fn unmountTmpfs(self: *BuildResult) void {
+        self.tmpfs_mount.deinit();
     }
 };
 
@@ -103,9 +119,50 @@ pub const RootfsBuilder = struct {
     ) BuildError!BuildResult {
         scoped_log.info("Building rootfs from {s}", .{image_ref});
 
+        // Estimate required size
+        const estimated_size = memory.estimateImageSize(image_ref) catch |err| {
+            scoped_log.warn("Cannot estimate image size: {}, using default 1GB", .{err});
+            return 1024 * 1024 * 1024;
+        };
+
+        const tmpfs_size: u64 = @intFromFloat(@as(f64, @floatFromInt(estimated_size)) * options.tmpfs_headroom);
+
+        scoped_log.info("Estimated rootfs size: {d}MB, allocating {d}MB tmpfs", .{
+            estimated_size / (1024 * 1024),
+            tmpfs_size / (1024 * 1024),
+        });
+
+        // Check available memory
+        _ = memory.checkAvailableMemory(tmpfs_size) catch |err| {
+            if (err == error.InsufficientMemory) {
+                const mem_info = memory.getMemInfo() catch {
+                    scoped_log.err("Cannot read memory info", .{});
+                    return error.InsufficientMemory;
+                };
+                scoped_log.err("Not enough RAM for in-memory rootfs", .{});
+                scoped_log.err("Required: {d}MB, Available: {d}MB, Total: {d}MB", .{
+                    tmpfs_size / (1024 * 1024),
+                    mem_info.available / (1024 * 1024),
+                    mem_info.total / (1024 * 1024),
+                });
+                return error.InsufficientMemory;
+            }
+            return error.InsufficientMemory;
+        };
+
+        scoped_log.info("Memory check passed", .{});
+
+        // Create tmpfs mount
+        var tmpfs_mount = memory.TmpfsMount.init(self.allocator, options.target_dir, tmpfs_size) catch |err| {
+            scoped_log.err("Failed to create tmpfs: {}", .{err});
+            return error.TmpfsMountFailed;
+        };
+        scoped_log.info("Tmpfs mounted at {s}", .{options.target_dir});
+        errdefer tmpfs_mount.deinit();
+
         // Check if local image
         if (oci_image.isLocalImage(image_ref)) {
-            return self.buildFromLocalImage(image_ref, options);
+            return self.buildFromLocalImage(image_ref, options, &tmpfs_mount);
         }
 
         // Parse image reference
@@ -113,33 +170,93 @@ pub const RootfsBuilder = struct {
             return error.InvalidImage;
         defer ref.deinit(self.allocator);
 
-        return self.buildFromRegistry(&ref, options);
+        return self.buildFromRegistry(&ref, options, &tmpfs_mount);
     }
 
-    /// Build from local tarball or OCI layout
-    pub fn buildFromLocalImage(
+    /// Build from local tarball, OCI layout, or plain directory
+    fn buildFromLocalImage(
         self: *Self,
         path: []const u8,
         options: BuildOptions,
+        tmpfs_mount: *memory.TmpfsMount,
     ) BuildError!BuildResult {
         scoped_log.info("Building rootfs from local image {s}", .{path});
-
-        // Ensure target directory exists
-        std.fs.makeDirAbsolute(options.target_dir) catch |err| {
-            if (err != error.PathAlreadyExists) {
-                scoped_log.err("Cannot create target directory: {}", .{err});
-                return error.IoError;
-            }
-        };
 
         if (std.mem.endsWith(u8, path, ".tar") or
             std.mem.endsWith(u8, path, ".tar.gz") or
             std.mem.endsWith(u8, path, ".tgz"))
         {
-            return self.buildFromTarball(path, options);
-        } else {
-            return self.buildFromOciLayout(path, options);
+            return self.buildFromTarball(path, options, tmpfs_mount);
         }
+
+        // Check if it's an OCI layout (has index.json)
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const index_path = std.fmt.bufPrint(&buf, "{s}/index.json", .{path}) catch
+            return error.InvalidImage;
+
+        if (std.fs.accessAbsolute(index_path, .{})) |_| {
+            return self.buildFromOciLayout(path, options, tmpfs_mount);
+        } else |_| {
+            // Plain directory - copy contents to tmpfs
+            return self.buildFromDirectory(path, options, tmpfs_mount);
+        }
+    }
+
+    /// Build from a plain directory by copying its contents to tmpfs
+    fn buildFromDirectory(
+        self: *Self,
+        src_path: []const u8,
+        options: BuildOptions,
+        tmpfs_mount: *memory.TmpfsMount,
+    ) BuildError!BuildResult {
+        scoped_log.info("Copying directory {s} to tmpfs", .{src_path});
+
+        // Use cp -a with explicit glob to copy directory contents (busybox compatible)
+        // The -T flag or trailing /. doesn't work reliably with busybox cp
+        // Instead, we use a subshell to copy all files including hidden ones
+        const cp_cmd = std.fmt.allocPrint(
+            self.allocator,
+            "cd {s} && cp -a . {s}",
+            .{ src_path, options.target_dir },
+        ) catch return error.OutOfMemory;
+        defer self.allocator.free(cp_cmd);
+
+        scoped_log.debug("Copy command: {s}", .{cp_cmd});
+
+        var child = std.process.Child.init(&.{ "sh", "-c", cp_cmd }, self.allocator);
+        child.spawn() catch return error.IoError;
+        const term = child.wait() catch return error.IoError;
+
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    scoped_log.err("Failed to copy directory: exit code {}", .{code});
+                    return error.IoError;
+                }
+            },
+            else => return error.IoError,
+        }
+
+        // Verify copy worked by listing target
+        scoped_log.debug("Verifying copy to {s}", .{options.target_dir});
+
+        // Get size
+        const size = getDirSize(options.target_dir, self.allocator) catch 0;
+
+        // Verify rootfs if requested
+        if (!options.skip_verify) {
+            if (!try verifyRootfs(options.target_dir, self.allocator)) {
+                scoped_log.warn("Rootfs verification failed - missing essential files", .{});
+            }
+        }
+
+        return BuildResult{
+            .rootfs_path = self.allocator.dupe(u8, options.target_dir) catch return error.OutOfMemory,
+            .layer_count = 1,
+            .total_size = size,
+            .config = null,
+            .tmpfs_mount = tmpfs_mount.*,
+        };
     }
 
     /// Build from a tarball
@@ -147,6 +264,7 @@ pub const RootfsBuilder = struct {
         self: *Self,
         tarball_path: []const u8,
         options: BuildOptions,
+        tmpfs_mount: *memory.TmpfsMount,
     ) BuildError!BuildResult {
         scoped_log.info("Extracting tarball {s}", .{tarball_path});
 
@@ -169,6 +287,7 @@ pub const RootfsBuilder = struct {
             .layer_count = 1,
             .total_size = size,
             .config = null,
+            .tmpfs_mount = tmpfs_mount.*,
         };
     }
 
@@ -177,6 +296,7 @@ pub const RootfsBuilder = struct {
         self: *Self,
         layout_path: []const u8,
         options: BuildOptions,
+        tmpfs_mount: *memory.TmpfsMount,
     ) BuildError!BuildResult {
         scoped_log.info("Building from OCI layout {s}", .{layout_path});
 
@@ -207,7 +327,7 @@ pub const RootfsBuilder = struct {
         const manifest_path = try blobPath(self.allocator, layout_path, digest.string);
         defer self.allocator.free(manifest_path);
 
-        return self.buildFromManifestFile(manifest_path, layout_path, options);
+        return self.buildFromManifestFile(manifest_path, layout_path, options, tmpfs_mount);
     }
 
     /// Build from a manifest file
@@ -216,6 +336,7 @@ pub const RootfsBuilder = struct {
         manifest_path: []const u8,
         blobs_base: []const u8,
         options: BuildOptions,
+        tmpfs_mount: *memory.TmpfsMount,
     ) BuildError!BuildResult {
         const manifest_file = std.fs.openFileAbsolute(manifest_path, .{}) catch
             return error.InvalidImage;
@@ -279,6 +400,7 @@ pub const RootfsBuilder = struct {
             .layer_count = layer_count,
             .total_size = size,
             .config = config,
+            .tmpfs_mount = tmpfs_mount.*,
         };
     }
 
@@ -287,6 +409,7 @@ pub const RootfsBuilder = struct {
         self: *Self,
         ref: *const oci_image.ImageReference,
         options: BuildOptions,
+        tmpfs_mount: *memory.TmpfsMount,
     ) BuildError!BuildResult {
         scoped_log.info("Pulling image from registry", .{});
 
@@ -300,7 +423,7 @@ pub const RootfsBuilder = struct {
         oci_registry.pullImage(self.allocator, ref, tmp_dir) catch return error.DownloadFailed;
 
         // Build from downloaded OCI layout
-        return self.buildFromOciLayout(tmp_dir, options);
+        return self.buildFromOciLayout(tmp_dir, options, tmpfs_mount);
     }
 
     /// Parse image config to get entrypoint/cmd
@@ -421,7 +544,9 @@ pub fn build(
     target_dir: []const u8,
 ) !BuildResult {
     var builder = RootfsBuilder.init(allocator);
-    return builder.buildFromImage(image_ref, .{ .target_dir = target_dir });
+    return builder.buildFromImage(image_ref, .{
+        .target_dir = target_dir,
+    });
 }
 
 test "BuildOptions defaults" {
