@@ -21,15 +21,22 @@ jobs:
       - name: Setup Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build release tarball
+      - name: Build release tarballs
         run: |
-          nix build .#releaseTarball -L
-          cp result/*.tar.gz .
+          # Build all architectures (Zig cross-compiles from x86_64)
+          nix build .#releaseTarball-x86_64 -L -o result-x86_64
+          nix build .#releaseTarball-aarch64 -L -o result-aarch64
+          nix build .#releaseTarball-armv7 -L -o result-armv7
 
-      - name: Upload artifact
+          # Copy tarballs
+          cp result-x86_64/*.tar.gz .
+          cp result-aarch64/*.tar.gz .
+          cp result-armv7/*.tar.gz .
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xenomorph-x86_64-linux
+          name: xenomorph-release
           path: "*.tar.gz"
 
   release:
