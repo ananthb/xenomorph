@@ -6,7 +6,7 @@ const scoped_log = log.scoped("config");
 /// Main configuration for xenomorph
 pub const Config = struct {
     /// OCI image reference (local path or registry URL)
-    image: []const u8,
+    image: []const u8 = "docker.io/library/alpine:latest",
 
     /// Command to execute post-pivot
     exec_cmd: []const u8 = "/bin/sh",
@@ -46,6 +46,25 @@ pub const Config = struct {
 
     /// Working directory for extraction
     work_dir: []const u8 = "/var/lib/xenomorph/rootfs",
+
+    /// Headless mode: fork, detach from terminal, log to file.
+    /// Survives SSH disconnection. Implies --force.
+    headless: bool = false,
+
+    /// Enable Tailscale integration (set implicitly by --tailscale-authkey)
+    tailscale: ?bool = null,
+
+    /// Tailscale auth key (implies --tailscale)
+    tailscale_authkey: ?[]const u8 = null,
+
+    /// Arguments for 'tailscale up' (null = auto-generate with --ssh --hostname)
+    tailscale_args: ?[]const u8 = null,
+
+    /// Check if tailscale integration is effectively enabled
+    pub fn tailscaleEnabled(self: *const Config) bool {
+        if (self.tailscale) |ts| return ts;
+        return self.tailscale_authkey != null;
+    }
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         _ = allocator;
@@ -90,9 +109,8 @@ pub fn parseArgs(allocator: std.mem.Allocator) !?Config {
 }
 
 fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
-    var cfg = Config{
-        .image = "",
-    };
+    var cfg = Config{};
+    var image_set = false;
 
     var exec_args_list: std.ArrayListUnmanaged([]const u8) = .{};
     defer exec_args_list.deinit(std.heap.page_allocator);
@@ -100,6 +118,7 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--image")) {
             cfg.image = args.next() orelse return error.MissingValue;
+            image_set = true;
         } else if (std.mem.eql(u8, arg, "--exec")) {
             cfg.exec_cmd = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--keep-old-root")) {
@@ -125,6 +144,17 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
             cfg.cache_dir = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--work-dir")) {
             cfg.work_dir = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--headless")) {
+            cfg.headless = true;
+            cfg.force = true;
+        } else if (std.mem.eql(u8, arg, "--tailscale") or std.mem.eql(u8, arg, "--tailscale=true")) {
+            cfg.tailscale = true;
+        } else if (std.mem.eql(u8, arg, "--tailscale=false") or std.mem.eql(u8, arg, "--no-tailscale")) {
+            cfg.tailscale = false;
+        } else if (std.mem.eql(u8, arg, "--tailscale-authkey")) {
+            cfg.tailscale_authkey = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--tailscale-args")) {
+            cfg.tailscale_args = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--")) {
             // Everything after -- is exec args
             while (args.next()) |exec_arg| {
@@ -132,8 +162,9 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
             }
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             // Positional argument is the image
-            if (cfg.image.len == 0) {
+            if (!image_set) {
                 cfg.image = arg;
+                image_set = true;
             } else {
                 try exec_args_list.append(std.heap.page_allocator, arg);
             }
@@ -141,12 +172,6 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
             std.debug.print("Unknown option: {s}\n", .{arg});
             return error.UnknownOption;
         }
-    }
-
-    if (cfg.image.len == 0) {
-        std.debug.print("Error: image is required\n\n", .{});
-        printUsage();
-        return error.MissingImage;
     }
 
     if (exec_args_list.items.len > 0) {
@@ -165,7 +190,7 @@ fn printUsage() void {
         \\    xenomorph pivot --image <ref> [options]
         \\
         \\ARGUMENTS:
-        \\    <image>                   OCI image reference (local path or registry URL)
+        \\    <image>                   OCI image reference (default: docker.io/library/alpine:latest)
         \\
         \\OPTIONS:
         \\    --image <ref>             OCI image reference (alternative to positional)
@@ -180,7 +205,15 @@ fn printUsage() void {
         \\    --work-dir <path>         Working directory for extraction
         \\    -v, --verbose             Verbose output
         \\    -n, --dry-run             Show what would be done without executing
+        \\    --headless                Detach from terminal (survives SSH disconnect)
         \\    -- <args>...              Arguments to pass to exec command
+        \\
+        \\TAILSCALE:
+        \\    --tailscale-authkey <key> Tailscale auth key (enables Tailscale integration)
+        \\    --tailscale-args <args>   Arguments for 'tailscale up'
+        \\                              (default: --ssh --hostname=<hostname>-xenomorph)
+        \\    --tailscale               Explicitly enable Tailscale
+        \\    --no-tailscale            Disable Tailscale (overrides --tailscale-authkey)
         \\
         \\EXAMPLES:
         \\    # Pivot to a local tarball
@@ -191,6 +224,9 @@ fn printUsage() void {
         \\
         \\    # Pivot with custom old root location
         \\    xenomorph pivot ubuntu:22.04 --keep-old-root /old
+        \\
+        \\    # Headless pivot over SSH with Tailscale reconnection
+        \\    xenomorph pivot alpine:latest --headless --tailscale-authkey tskey-auth-xxxxx
         \\
         \\SUBCOMMANDS:
         \\    pivot       Execute pivot_root to new rootfs
@@ -252,22 +288,27 @@ fn parseConfigFile(allocator: std.mem.Allocator, content: []const u8) !Config {
 }
 
 /// Validate configuration
-pub fn validate(config: *const Config) !void {
-    if (config.image.len == 0) {
-        return error.MissingImage;
+pub fn validate(cfg: *const Config) !void {
+    if (cfg.timeout == 0) {
+        return error.InvalidTimeout;
     }
 
-    if (config.timeout == 0) {
-        return error.InvalidTimeout;
+    if (cfg.tailscaleEnabled() and cfg.tailscale_authkey == null) {
+        std.debug.print("Error: --tailscale requires --tailscale-authkey\n", .{});
+        return error.TailscaleMissingAuthkey;
+    }
+
+    if (cfg.headless and !cfg.tailscaleEnabled()) {
+        std.debug.print("Error: --headless requires an alternative login method (e.g. --tailscale-authkey)\n", .{});
+        return error.HeadlessRequiresLoginMethod;
     }
 }
 
-test "parse empty config" {
-    const config = Config{
-        .image = "alpine:latest",
-    };
+test "default config" {
+    const config = Config{};
 
     const testing = std.testing;
+    try testing.expectEqualStrings("docker.io/library/alpine:latest", config.image);
     try testing.expectEqualStrings("/bin/sh", config.exec_cmd);
     try testing.expectEqualStrings("/mnt/oldroot", config.keep_old_root);
     try testing.expectEqual(@as(u32, 30), config.timeout);

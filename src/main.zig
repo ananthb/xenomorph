@@ -37,6 +37,7 @@ pub const process_terminator = @import("process/terminator.zig");
 pub const process_essential = @import("process/essential.zig");
 pub const process_namespace = @import("process/namespace.zig");
 
+pub const tailscale = @import("tailscale.zig");
 pub const config = @import("config.zig");
 
 const scoped_log = log.scoped("main");
@@ -64,13 +65,37 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    runPivot(allocator, &cfg) catch |err| {
+    // Resolve effective tailscale args (need this before fork for the pre-exit print)
+    const effective_ts_args = resolveTailscaleArgs(allocator, &cfg);
+
+    if (cfg.headless) {
+        // Pre-flight checks before forking — errors must appear on the terminal
+        if (std.os.linux.getuid() != 0) {
+            std.debug.print("Error: must run as root\n", .{});
+            std.process.exit(1);
+        }
+        if (cfg.tailscaleEnabled()) {
+            // Validate authkey format
+            if (cfg.tailscale_authkey) |key| {
+                if (!std.mem.startsWith(u8, key, "tskey-auth-") and
+                    !std.mem.startsWith(u8, key, "tskey-"))
+                {
+                    std.debug.print("Error: tailscale authkey doesn't look valid (expected tskey-auth-... or tskey-...)\n", .{});
+                    std.process.exit(1);
+                }
+            }
+            std.debug.print("xenomorph: tailscale up args: {s}\n", .{effective_ts_args});
+        }
+        daemonize();
+    }
+
+    runPivot(allocator, &cfg, effective_ts_args) catch |err| {
         scoped_log.err("Pivot failed: {}", .{err});
         std.process.exit(1);
     };
 }
 
-fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
+fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_ts_args: []const u8) !void {
     scoped_log.info("Starting xenomorph pivot", .{});
     scoped_log.info("Image: {s}", .{cfg.image});
 
@@ -80,7 +105,7 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     }
 
     if (cfg.dry_run) {
-        try dryRun(allocator, cfg);
+        try dryRun(allocator, cfg, effective_ts_args);
         return;
     }
 
@@ -130,6 +155,42 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         }
     }
 
+    // Tailscale injection (after rootfs is built, before pivot)
+    var ts_exec_cmd: []const u8 = cfg.exec_cmd;
+    var ts_exec_args: ?[]const []const u8 = if (cfg.exec_args.len > 0) cfg.exec_args else null;
+
+    if (cfg.tailscaleEnabled()) {
+        scoped_log.info("Setting up Tailscale integration", .{});
+        var injector = tailscale.TailscaleInjector.init(allocator, cfg.tailscale_authkey.?, effective_ts_args);
+        defer injector.deinit();
+
+        injector.inject(cfg.work_dir) catch |err| {
+            scoped_log.err("Tailscale injection failed: {}", .{err});
+            if (err == error.PlatformNotSupported) {
+                scoped_log.err("Current platform not supported by Tailscale image", .{});
+            } else if (err == error.BinaryNotFound) {
+                scoped_log.err("tailscale/tailscaled binaries not found in docker.io/tailscale/tailscale", .{});
+            }
+            return err;
+        };
+
+        injector.createStartupScript(cfg.work_dir) catch |err| {
+            scoped_log.err("Failed to create Tailscale startup script: {}", .{err});
+            return err;
+        };
+
+        // Wrap exec: run the init script which starts tailscale then exec's the real command
+        var new_args: std.ArrayListUnmanaged([]const u8) = .{};
+        try new_args.append(std.heap.page_allocator, cfg.exec_cmd);
+        if (cfg.exec_args.len > 0) {
+            try new_args.appendSlice(std.heap.page_allocator, cfg.exec_args);
+        }
+        ts_exec_args = try new_args.toOwnedSlice(std.heap.page_allocator);
+        ts_exec_cmd = "/usr/local/bin/xenomorph-ts-init";
+
+        scoped_log.info("Tailscale integration configured", .{});
+    }
+
     if (!cfg.no_init_coord and !init_interface.shouldSkipCoordination()) {
         scoped_log.info("Coordinating with init system", .{});
 
@@ -176,8 +237,8 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     try pivot.executePivot(.{
         .new_root = cfg.work_dir,
         .old_root_mount = cfg.keep_old_root[1..], // Remove leading /
-        .exec_cmd = cfg.exec_cmd,
-        .exec_args = if (cfg.exec_args.len > 0) cfg.exec_args else null,
+        .exec_cmd = ts_exec_cmd,
+        .exec_args = ts_exec_args,
         .keep_old_root = !cfg.no_keep_old_root,
         .allocator = allocator,
     });
@@ -186,7 +247,7 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     scoped_log.info("Pivot complete", .{});
 }
 
-fn dryRun(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
+fn dryRun(allocator: std.mem.Allocator, cfg: *const config.Config, effective_ts_args: []const u8) !void {
     const stdout = std.fs.File.stdout().deprecatedWriter();
 
     try stdout.print("\n=== DRY RUN ===\n\n", .{});
@@ -195,6 +256,9 @@ fn dryRun(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     try stdout.print("Exec command: {s}\n", .{cfg.exec_cmd});
     try stdout.print("Old root mount: {s}\n", .{cfg.keep_old_root});
     try stdout.print("Timeout: {}s\n", .{cfg.timeout});
+    if (cfg.headless) {
+        try stdout.print("Mode: headless (will fork and detach, log to /var/log/xenomorph.log)\n", .{});
+    }
 
     try stdout.print("\nSteps that would be performed:\n", .{});
     try stdout.print("  1. Build rootfs from {s}\n", .{cfg.image});
@@ -211,11 +275,20 @@ fn dryRun(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         try stdout.print("  3. Skip init coordination (--no-init-coord)\n", .{});
     }
 
-    try stdout.print("  5. Terminate non-essential processes\n", .{});
-    try stdout.print("  6. Create mount namespace\n", .{});
-    try stdout.print("  7. Execute pivot_root\n", .{});
-    try stdout.print("  8. Mount old root at {s}\n", .{cfg.keep_old_root});
-    try stdout.print("  9. Execute {s}\n", .{cfg.exec_cmd});
+    if (cfg.tailscaleEnabled()) {
+        try stdout.print("  5. Inject Tailscale from docker.io/tailscale/tailscale\n", .{});
+        try stdout.print("     - Auth key: {s}...{s}\n", .{
+            cfg.tailscale_authkey.?[0..@min(cfg.tailscale_authkey.?.len, 8)],
+            if (cfg.tailscale_authkey.?.len > 12) cfg.tailscale_authkey.?[cfg.tailscale_authkey.?.len - 4 ..] else "",
+        });
+        try stdout.print("     - Args: {s}\n", .{effective_ts_args});
+    }
+
+    try stdout.print("  6. Terminate non-essential processes\n", .{});
+    try stdout.print("  7. Create mount namespace\n", .{});
+    try stdout.print("  8. Execute pivot_root\n", .{});
+    try stdout.print("  9. Mount old root at {s}\n", .{cfg.keep_old_root});
+    try stdout.print(" 10. Execute {s}\n", .{cfg.exec_cmd});
 
     try stdout.print("\n=== END DRY RUN ===\n", .{});
 }
@@ -240,6 +313,84 @@ fn confirmPivot() !bool {
 
     const response = std.mem.trim(u8, buf[0..n], " \t\r\n");
     return std.mem.eql(u8, response, "y") or std.mem.eql(u8, response, "Y");
+}
+
+/// Resolve the effective tailscale up arguments.
+/// If the user provided --tailscale-args, use that.
+/// Otherwise, generate a default: --ssh --hostname=<hostname>-xenomorph
+fn resolveTailscaleArgs(allocator: std.mem.Allocator, cfg: *const config.Config) []const u8 {
+    if (!cfg.tailscaleEnabled()) return "--ssh";
+    if (cfg.tailscale_args) |args| return args;
+
+    // Detect hostname via uname syscall
+    var uts: std.os.linux.utsname = undefined;
+    _ = std.os.linux.syscall1(.uname, @intFromPtr(&uts));
+    const hostname = std.mem.sliceTo(&uts.nodename, 0);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "--ssh --hostname={s}-xenomorph",
+        .{hostname},
+    ) catch "--ssh";
+}
+
+/// Fork and detach from the controlling terminal.
+/// The parent prints the child PID and log path, then exits immediately.
+/// The child continues in a new session with stderr redirected to a log file.
+fn daemonize() void {
+    const linux = std.os.linux;
+    const headless_log = "/var/log/xenomorph.log";
+
+    // Ensure log directory exists
+    std.fs.makeDirAbsolute("/var/log") catch {};
+
+    // Open log file (create/truncate, write-only)
+    const log_fd = std.posix.open(
+        headless_log,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+        0o644,
+    ) catch {
+        std.debug.print("Error: cannot create {s}\n", .{headless_log});
+        std.process.exit(1);
+    };
+
+    // Fork
+    const fork_result = linux.syscall0(.fork);
+    if (linux.E.init(fork_result) != .SUCCESS) {
+        std.debug.print("Error: fork failed\n", .{});
+        std.process.exit(1);
+    }
+
+    if (fork_result > 0) {
+        // Parent: print status and exit, freeing the SSH shell
+        std.debug.print("xenomorph: daemonized (pid={}, log={s})\n", .{ fork_result, headless_log });
+        std.process.exit(0);
+    }
+
+    // --- Child continues below ---
+
+    // Create a new session so we're not tied to the SSH terminal.
+    // When sshd is killed during pivot, SIGHUP goes to the old session, not us.
+    _ = linux.syscall0(.setsid);
+
+    // Redirect stdin/stdout to /dev/null, stderr to the log file
+    const null_fd = std.posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch {
+        // Fallback: just redirect stderr
+        _ = std.posix.dup2(log_fd, 2) catch {};
+        log.setColors(false);
+        return;
+    };
+
+    _ = std.posix.dup2(null_fd, 0) catch {}; // stdin  -> /dev/null
+    _ = std.posix.dup2(null_fd, 1) catch {}; // stdout -> /dev/null
+    _ = std.posix.dup2(log_fd, 2) catch {}; // stderr -> log file
+
+    // Close the original fds (dup2 created new references on 0/1/2)
+    std.posix.close(null_fd);
+    std.posix.close(log_fd);
+
+    // No terminal, no colors
+    log.setColors(false);
 }
 
 test "all modules compile" {
@@ -269,5 +420,6 @@ test "all modules compile" {
     _ = process_terminator;
     _ = process_essential;
     _ = process_namespace;
+    _ = tailscale;
     _ = config;
 }
