@@ -1,10 +1,13 @@
 const std = @import("std");
 const log = @import("../util/log.zig");
 const memory = @import("../util/memory.zig");
-const oci_image = @import("../oci/image.zig");
-const oci_layer = @import("../oci/layer.zig");
-const oci_registry = @import("../oci/registry.zig");
-const oci_cache = @import("../oci/cache.zig");
+const oci_image = @import("oci").image;
+const oci_layer = @import("oci").layer;
+const oci_registry = @import("oci").registry;
+const oci_cache = @import("oci").cache;
+const config_mod = @import("../config.zig");
+
+pub const Layer = config_mod.Layer;
 
 const scoped_log = log.scoped("rootfs/builder");
 
@@ -56,12 +59,7 @@ pub const BuildResult = struct {
     /// Tmpfs mount - caller must keep this alive until after pivot
     tmpfs_mount: memory.TmpfsMount,
 
-    pub const ImageConfig = struct {
-        entrypoint: ?[]const []const u8,
-        cmd: ?[]const []const u8,
-        env: ?[]const []const u8,
-        working_dir: ?[]const u8,
-    };
+    pub const ImageConfig = @import("oci").layout_writer.ImageConfig;
 
     pub fn deinit(self: *BuildResult, allocator: std.mem.Allocator) void {
         allocator.free(self.rootfs_path);
@@ -171,6 +169,31 @@ pub const RootfsBuilder = struct {
         defer ref.deinit(self.allocator);
 
         return self.buildFromRegistry(&ref, options, &tmpfs_mount);
+    }
+
+    /// Build rootfs from a Layer (dispatches to local or registry based on tag)
+    pub fn buildFromLayer(
+        self: *Self,
+        layer: Layer,
+        options: BuildOptions,
+    ) BuildError!BuildResult {
+        return switch (layer) {
+            .image => |ref| self.buildFromImage(ref, options),
+            .rootfs => |path| self.buildFromImage(path, options),
+        };
+    }
+
+    /// Merge a Layer into an existing rootfs (dispatches on tag).
+    /// Returns the ImageConfig from the merged layer if it was an OCI image, null otherwise.
+    pub fn mergeLayer(
+        self: *Self,
+        layer: Layer,
+        target_dir: []const u8,
+    ) BuildError!?BuildResult.ImageConfig {
+        return switch (layer) {
+            .image => |ref| self.mergeImage(ref, target_dir),
+            .rootfs => |path| self.mergeLocalImage(path, target_dir),
+        };
     }
 
     /// Build from local tarball, OCI layout, or plain directory
@@ -426,6 +449,160 @@ pub const RootfsBuilder = struct {
         return self.buildFromOciLayout(tmp_dir, options, tmpfs_mount);
     }
 
+    /// Merge an additional OCI image into an existing rootfs directory.
+    /// Extracts all layers on top of the existing files (later wins on conflict).
+    /// Returns the ImageConfig from the merged image if available.
+    pub fn mergeImage(
+        self: *Self,
+        image_ref: []const u8,
+        target_dir: []const u8,
+    ) BuildError!?BuildResult.ImageConfig {
+        scoped_log.info("Merging image {s} into rootfs", .{image_ref});
+
+        if (oci_image.isLocalImage(image_ref)) {
+            return try self.mergeLocalImage(image_ref, target_dir);
+        } else {
+            return try self.mergeRegistryImage(image_ref, target_dir);
+        }
+    }
+
+    fn mergeLocalImage(self: *Self, path: []const u8, target_dir: []const u8) BuildError!?BuildResult.ImageConfig {
+        if (std.mem.endsWith(u8, path, ".tar") or
+            std.mem.endsWith(u8, path, ".tar.gz") or
+            std.mem.endsWith(u8, path, ".tgz"))
+        {
+            const compression: oci_layer.Compression = if (std.mem.endsWith(u8, path, ".tar.gz") or
+                std.mem.endsWith(u8, path, ".tgz"))
+                .gzip
+            else
+                .none;
+
+            oci_layer.extractLayer(path, compression, .{
+                .target = target_dir,
+                .handle_whiteouts = true,
+            }, self.allocator) catch return error.LayerExtractionFailed;
+            return null;
+        }
+
+        // Check for OCI layout
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const index_path = std.fmt.bufPrint(&buf, "{s}/index.json", .{path}) catch
+            return error.InvalidImage;
+
+        if (std.fs.accessAbsolute(index_path, .{})) |_| {
+            return try self.mergeOciLayout(path, target_dir);
+        } else |_| {
+            // Plain directory
+            const cp_cmd = std.fmt.allocPrint(
+                self.allocator,
+                "cd {s} && cp -a . {s}",
+                .{ path, target_dir },
+            ) catch return error.OutOfMemory;
+            defer self.allocator.free(cp_cmd);
+
+            var child = std.process.Child.init(&.{ "sh", "-c", cp_cmd }, self.allocator);
+            child.spawn() catch return error.IoError;
+            const term = child.wait() catch return error.IoError;
+            switch (term) {
+                .Exited => |code| {
+                    if (code != 0) return error.IoError;
+                },
+                else => return error.IoError,
+            }
+            return null;
+        }
+    }
+
+    fn mergeRegistryImage(self: *Self, image_ref: []const u8, target_dir: []const u8) BuildError!?BuildResult.ImageConfig {
+        var ref = oci_image.ImageReference.parse(image_ref, self.allocator) catch
+            return error.InvalidImage;
+        defer ref.deinit(self.allocator);
+
+        const tmp_dir = "/tmp/xenomorph-merge";
+        std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+        std.fs.makeDirAbsolute(tmp_dir) catch return error.IoError;
+        defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+
+        oci_registry.pullImage(self.allocator, &ref, tmp_dir) catch return error.DownloadFailed;
+        return try self.mergeOciLayout(tmp_dir, target_dir);
+    }
+
+    /// Extract layers from an OCI layout into an existing directory.
+    /// Returns the ImageConfig from the manifest if available.
+    fn mergeOciLayout(self: *Self, layout_path: []const u8, target_dir: []const u8) BuildError!?BuildResult.ImageConfig {
+        // Read index.json
+        const index_path = std.fs.path.join(self.allocator, &.{ layout_path, "index.json" }) catch
+            return error.OutOfMemory;
+        defer self.allocator.free(index_path);
+
+        const index_file = std.fs.openFileAbsolute(index_path, .{}) catch
+            return error.InvalidImage;
+        defer index_file.close();
+
+        var index_buf: [16384]u8 = undefined;
+        const n = index_file.readAll(&index_buf) catch return error.IoError;
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, index_buf[0..n], .{}) catch
+            return error.ManifestParseError;
+        defer parsed.deinit();
+
+        const manifests = parsed.value.object.get("manifests") orelse return error.ManifestParseError;
+        if (manifests.array.items.len == 0) return error.ManifestParseError;
+
+        const digest = manifests.array.items[0].object.get("digest") orelse
+            return error.ManifestParseError;
+
+        // Read manifest
+        const manifest_path = try blobPath(self.allocator, layout_path, digest.string);
+        defer self.allocator.free(manifest_path);
+
+        const manifest_file = std.fs.openFileAbsolute(manifest_path, .{}) catch
+            return error.InvalidImage;
+        defer manifest_file.close();
+
+        var manifest_buf: [65536]u8 = undefined;
+        const mn = manifest_file.readAll(&manifest_buf) catch return error.IoError;
+
+        const manifest_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, manifest_buf[0..mn], .{}) catch
+            return error.ManifestParseError;
+        defer manifest_parsed.deinit();
+
+        const layers = manifest_parsed.value.object.get("layers") orelse
+            return error.ManifestParseError;
+
+        scoped_log.info("Merging {} layers", .{layers.array.items.len});
+
+        for (layers.array.items) |layer_desc| {
+            const layer_digest = layer_desc.object.get("digest") orelse continue;
+            const media_type = layer_desc.object.get("mediaType") orelse continue;
+
+            const layer_path = try blobPath(self.allocator, layout_path, layer_digest.string);
+            defer self.allocator.free(layer_path);
+
+            const compression = oci_layer.Compression.fromMediaType(media_type.string);
+
+            scoped_log.debug("Merging layer {s}", .{layer_digest.string});
+
+            oci_layer.extractLayer(layer_path, compression, .{
+                .target = target_dir,
+                .handle_whiteouts = true,
+            }, self.allocator) catch |err| {
+                scoped_log.err("Failed to extract layer: {}", .{err});
+                return error.LayerExtractionFailed;
+            };
+        }
+
+        // Parse config for image config
+        var img_config: ?BuildResult.ImageConfig = null;
+        if (manifest_parsed.value.object.get("config")) |config_desc| {
+            if (config_desc.object.get("digest")) |config_digest| {
+                img_config = self.parseImageConfig(layout_path, config_digest.string) catch null;
+            }
+        }
+
+        return img_config;
+    }
+
     /// Parse image config to get entrypoint/cmd
     fn parseImageConfig(self: *Self, blobs_base: []const u8, digest: []const u8) !BuildResult.ImageConfig {
         const config_path = try blobPath(self.allocator, blobs_base, digest);
@@ -474,6 +651,16 @@ pub const RootfsBuilder = struct {
         if (config.object.get("WorkingDir")) |wd| {
             if (wd != .null) {
                 result.working_dir = try self.allocator.dupe(u8, wd.string);
+            }
+        }
+
+        if (config.object.get("Env")) |env_val| {
+            if (env_val != .null) {
+                var list: std.ArrayListUnmanaged([]const u8) = .{};
+                for (env_val.array.items) |item| {
+                    try list.append(self.allocator, try self.allocator.dupe(u8, item.string));
+                }
+                result.env = try list.toOwnedSlice(self.allocator);
             }
         }
 

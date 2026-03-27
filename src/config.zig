@@ -3,10 +3,23 @@ const log = @import("util/log.zig");
 
 const scoped_log = log.scoped("config");
 
+/// A layer source for the rootfs, either a local path or an OCI image reference.
+pub const Layer = union(enum) {
+    /// OCI image reference (pulled from registry)
+    image: []const u8,
+    /// Local rootfs directory or tarball
+    rootfs: []const u8,
+};
+
+pub const Subcommand = enum { pivot, build };
+
 /// Main configuration for xenomorph
 pub const Config = struct {
-    /// OCI image reference (local path or registry URL)
-    image: []const u8 = "docker.io/library/alpine:latest",
+    /// Which subcommand was invoked
+    subcommand: Subcommand = .pivot,
+
+    /// Ordered list of layers to merge into the rootfs (later wins on conflict)
+    layers: []const Layer = &.{.{ .image = "docker.io/library/alpine:latest" }},
 
     /// Command to execute post-pivot
     exec_cmd: []const u8 = "/bin/sh",
@@ -47,9 +60,24 @@ pub const Config = struct {
     /// Working directory for extraction
     work_dir: []const u8 = "/var/lib/xenomorph/rootfs",
 
+    /// Output path for generate subcommand (OCI layout directory)
+    output: []const u8 = "rootfs.oci",
+
+    /// Optional additional rootfs tarball output for generate
+    rootfs_output: ?[]const u8 = null,
+
+    /// Whether --exec was explicitly set by the user
+    exec_cmd_explicit: bool = false,
+
     /// Headless mode: fork, detach from terminal, log to file.
     /// Survives SSH disconnection. Implies --force.
     headless: bool = false,
+
+    /// Path to Containerfile/Dockerfile
+    containerfile: ?[]const u8 = null,
+
+    /// Build context directory (default: directory containing containerfile)
+    context: ?[]const u8 = null,
 
     /// Enable Tailscale integration (set implicitly by --tailscale-authkey)
     tailscale: ?bool = null,
@@ -89,6 +117,8 @@ pub fn parseArgs(allocator: std.mem.Allocator) !?Config {
 
     if (std.mem.eql(u8, subcommand, "pivot")) {
         return try parsePivotArgs(&args);
+    } else if (std.mem.eql(u8, subcommand, "build")) {
+        return try parseBuildArgs(&args);
     } else if (std.mem.eql(u8, subcommand, "help") or
         std.mem.eql(u8, subcommand, "--help") or
         std.mem.eql(u8, subcommand, "-h"))
@@ -110,17 +140,21 @@ pub fn parseArgs(allocator: std.mem.Allocator) !?Config {
 
 fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
     var cfg = Config{};
-    var image_set = false;
+
+    var layers_list: std.ArrayListUnmanaged(Layer) = .{};
+    defer layers_list.deinit(std.heap.page_allocator);
 
     var exec_args_list: std.ArrayListUnmanaged([]const u8) = .{};
     defer exec_args_list.deinit(std.heap.page_allocator);
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--image")) {
-            cfg.image = args.next() orelse return error.MissingValue;
-            image_set = true;
+            try layers_list.append(std.heap.page_allocator, .{ .image = args.next() orelse return error.MissingValue });
+        } else if (std.mem.eql(u8, arg, "--rootfs")) {
+            try layers_list.append(std.heap.page_allocator, .{ .rootfs = args.next() orelse return error.MissingValue });
         } else if (std.mem.eql(u8, arg, "--exec")) {
             cfg.exec_cmd = args.next() orelse return error.MissingValue;
+            cfg.exec_cmd_explicit = true;
         } else if (std.mem.eql(u8, arg, "--keep-old-root")) {
             cfg.keep_old_root = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
@@ -147,6 +181,10 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
         } else if (std.mem.eql(u8, arg, "--headless")) {
             cfg.headless = true;
             cfg.force = true;
+        } else if (std.mem.eql(u8, arg, "--containerfile") or std.mem.eql(u8, arg, "--dockerfile")) {
+            cfg.containerfile = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--context")) {
+            cfg.context = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--tailscale") or std.mem.eql(u8, arg, "--tailscale=true")) {
             cfg.tailscale = true;
         } else if (std.mem.eql(u8, arg, "--tailscale=false") or std.mem.eql(u8, arg, "--no-tailscale")) {
@@ -160,22 +198,60 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
             while (args.next()) |exec_arg| {
                 try exec_args_list.append(std.heap.page_allocator, exec_arg);
             }
-        } else if (!std.mem.startsWith(u8, arg, "-")) {
-            // Positional argument is the image
-            if (!image_set) {
-                cfg.image = arg;
-                image_set = true;
-            } else {
-                try exec_args_list.append(std.heap.page_allocator, arg);
-            }
         } else {
             std.debug.print("Unknown option: {s}\n", .{arg});
             return error.UnknownOption;
         }
     }
 
+    if (layers_list.items.len > 0) {
+        cfg.layers = try layers_list.toOwnedSlice(std.heap.page_allocator);
+    }
+
     if (exec_args_list.items.len > 0) {
         cfg.exec_args = try exec_args_list.toOwnedSlice(std.heap.page_allocator);
+    }
+
+    return cfg;
+}
+
+fn parseBuildArgs(args: *std.process.ArgIterator) !Config {
+    var cfg = Config{ .subcommand = .build };
+
+    var layers_list: std.ArrayListUnmanaged(Layer) = .{};
+    defer layers_list.deinit(std.heap.page_allocator);
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--image")) {
+            try layers_list.append(std.heap.page_allocator, .{ .image = args.next() orelse return error.MissingValue });
+        } else if (std.mem.eql(u8, arg, "--rootfs")) {
+            try layers_list.append(std.heap.page_allocator, .{ .rootfs = args.next() orelse return error.MissingValue });
+        } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
+            cfg.output = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--rootfs-output")) {
+            cfg.rootfs_output = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+            cfg.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--work-dir")) {
+            cfg.work_dir = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--containerfile") or std.mem.eql(u8, arg, "--dockerfile")) {
+            cfg.containerfile = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--context")) {
+            cfg.context = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--tailscale") or std.mem.eql(u8, arg, "--tailscale=true")) {
+            cfg.tailscale = true;
+        } else if (std.mem.eql(u8, arg, "--tailscale-authkey")) {
+            cfg.tailscale_authkey = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--tailscale-args")) {
+            cfg.tailscale_args = args.next() orelse return error.MissingValue;
+        } else {
+            std.debug.print("Unknown option: {s}\n", .{arg});
+            return error.UnknownOption;
+        }
+    }
+
+    if (layers_list.items.len > 0) {
+        cfg.layers = try layers_list.toOwnedSlice(std.heap.page_allocator);
     }
 
     return cfg;
@@ -186,14 +262,14 @@ fn printUsage() void {
         \\xenomorph - Pivot root to an OCI-based rootfs
         \\
         \\USAGE:
-        \\    xenomorph pivot <image> [options]
-        \\    xenomorph pivot --image <ref> [options]
+        \\    xenomorph pivot [options]
         \\
-        \\ARGUMENTS:
-        \\    <image>                   OCI image reference (default: docker.io/library/alpine:latest)
+        \\LAYERS (merged in order, later wins on conflict):
+        \\    --image <ref>             OCI image from registry (repeatable)
+        \\    --rootfs <path>           Local rootfs directory or tarball (repeatable)
+        \\                              (default: --image docker.io/library/alpine:latest)
         \\
         \\OPTIONS:
-        \\    --image <ref>             OCI image reference (alternative to positional)
         \\    --exec <cmd>              Command to execute post-pivot (default: /bin/sh)
         \\    --keep-old-root <path>    Mount point for old root (default: /mnt/oldroot)
         \\    --no-keep-old-root        Don't keep old root accessible
@@ -206,6 +282,9 @@ fn printUsage() void {
         \\    -v, --verbose             Verbose output
         \\    -n, --dry-run             Show what would be done without executing
         \\    --headless                Detach from terminal (survives SSH disconnect)
+        \\    --containerfile <path>    Build from Containerfile/Dockerfile
+        \\    --dockerfile <path>       Alias for --containerfile
+        \\    --context <dir>           Build context directory (default: containerfile dir)
         \\    -- <args>...              Arguments to pass to exec command
         \\
         \\TAILSCALE:
@@ -216,20 +295,26 @@ fn printUsage() void {
         \\    --no-tailscale            Disable Tailscale (overrides --tailscale-authkey)
         \\
         \\EXAMPLES:
-        \\    # Pivot to a local tarball
-        \\    xenomorph pivot ./rootfs.tar --exec /bin/bash
+        \\    # Pivot to alpine (default)
+        \\    xenomorph pivot
         \\
-        \\    # Pivot to a registry image
-        \\    xenomorph pivot alpine:latest
+        \\    # Pivot to a specific image
+        \\    xenomorph pivot --image ubuntu:22.04
         \\
-        \\    # Pivot with custom old root location
-        \\    xenomorph pivot ubuntu:22.04 --keep-old-root /old
+        \\    # Merge a local rootfs tarball with a registry image
+        \\    xenomorph pivot --rootfs ./base.tar.gz --image myapp:latest
         \\
-        \\    # Headless pivot over SSH with Tailscale reconnection
-        \\    xenomorph pivot alpine:latest --headless --tailscale-authkey tskey-auth-xxxxx
+        \\    # Headless pivot over SSH with Tailscale
+        \\    xenomorph pivot --headless --tailscale-authkey tskey-auth-xxxxx
+        \\
+        \\BUILD:
+        \\    xenomorph build [--image <ref>...] [--rootfs <path>...] [-o <dir>]
+        \\    -o, --output <dir>        Output OCI layout directory (default: rootfs.oci)
+        \\    --rootfs-output <file>    Also write a rootfs tarball
         \\
         \\SUBCOMMANDS:
         \\    pivot       Execute pivot_root to new rootfs
+        \\    build       Build OCI image without pivoting
         \\    help        Show this help message
         \\    version     Show version information
         \\
@@ -255,9 +340,7 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
 fn parseConfigFile(allocator: std.mem.Allocator, content: []const u8) !Config {
     _ = allocator;
 
-    var config = Config{
-        .image = "",
-    };
+    var cfg = Config{};
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
@@ -269,22 +352,22 @@ fn parseConfigFile(allocator: std.mem.Allocator, content: []const u8) !Config {
             const value = std.mem.trim(u8, trimmed[eq_idx + 1 ..], " \t\"'");
 
             if (std.mem.eql(u8, key, "image")) {
-                config.image = value;
+                cfg.layers = &.{.{ .image = value }};
             } else if (std.mem.eql(u8, key, "exec")) {
-                config.exec_cmd = value;
+                cfg.exec_cmd = value;
             } else if (std.mem.eql(u8, key, "keep_old_root")) {
-                config.keep_old_root = value;
+                cfg.keep_old_root = value;
             } else if (std.mem.eql(u8, key, "timeout")) {
-                config.timeout = try std.fmt.parseInt(u32, value, 10);
+                cfg.timeout = try std.fmt.parseInt(u32, value, 10);
             } else if (std.mem.eql(u8, key, "force")) {
-                config.force = std.mem.eql(u8, value, "true");
+                cfg.force = std.mem.eql(u8, value, "true");
             } else if (std.mem.eql(u8, key, "verbose")) {
-                config.verbose = std.mem.eql(u8, value, "true");
+                cfg.verbose = std.mem.eql(u8, value, "true");
             }
         }
     }
 
-    return config;
+    return cfg;
 }
 
 /// Validate configuration
@@ -305,11 +388,15 @@ pub fn validate(cfg: *const Config) !void {
 }
 
 test "default config" {
-    const config = Config{};
+    const cfg = Config{};
 
     const testing = std.testing;
-    try testing.expectEqualStrings("docker.io/library/alpine:latest", config.image);
-    try testing.expectEqualStrings("/bin/sh", config.exec_cmd);
-    try testing.expectEqualStrings("/mnt/oldroot", config.keep_old_root);
-    try testing.expectEqual(@as(u32, 30), config.timeout);
+    try testing.expectEqual(@as(usize, 1), cfg.layers.len);
+    try testing.expectEqualStrings("docker.io/library/alpine:latest", cfg.layers[0].image);
+    try testing.expectEqualStrings("/bin/sh", cfg.exec_cmd);
+    try testing.expectEqualStrings("/mnt/oldroot", cfg.keep_old_root);
+    try testing.expectEqual(@as(u32, 30), cfg.timeout);
+    try testing.expectEqualStrings("rootfs.oci", cfg.output);
+    try testing.expect(!cfg.exec_cmd_explicit);
+    try testing.expect(cfg.rootfs_output == null);
 }

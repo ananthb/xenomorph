@@ -36,6 +36,9 @@ pub const PivotConfig = struct {
     /// Keep old root accessible after pivot
     keep_old_root: bool = true,
 
+    /// Environment variables for the exec'd command (null = inherit current env)
+    exec_env: ?[]const []const u8 = null,
+
     /// Allocator for temporary allocations
     allocator: std.mem.Allocator,
 };
@@ -153,7 +156,7 @@ pub fn executePivot(config: PivotConfig) PivotError!void {
 
         // Execute post-pivot command if specified (same as pivot_root path)
         if (config.exec_cmd) |cmd| {
-            try execCommand(cmd, config.exec_args);
+            try execCommand(cmd, config.exec_args, config.exec_env);
         }
         return;
     };
@@ -182,12 +185,12 @@ pub fn executePivot(config: PivotConfig) PivotError!void {
 
     // Execute post-pivot command if specified
     if (config.exec_cmd) |cmd| {
-        try execCommand(cmd, config.exec_args);
+        try execCommand(cmd, config.exec_args, config.exec_env);
     }
 }
 
 /// Execute a command (replaces current process)
-fn execCommand(cmd: []const u8, args: ?[]const []const u8) PivotError!void {
+fn execCommand(cmd: []const u8, args: ?[]const []const u8, env: ?[]const []const u8) PivotError!void {
     scoped_log.info("Executing: {s}", .{cmd});
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -212,11 +215,22 @@ fn execCommand(cmd: []const u8, args: ?[]const []const u8) PivotError!void {
     // Null terminate argv
     argv.append(allocator, null) catch return error.AllocationFailed;
 
-    // Get environment from libc
-    const envp = std.c.environ;
+    // Build envp: use custom env if provided, otherwise inherit from libc
+    var envp_ptr: [*:null]const ?[*:0]const u8 = undefined;
+    if (env) |env_list| {
+        var envp_list: std.ArrayListUnmanaged(?[*:0]const u8) = .{};
+        for (env_list) |e| {
+            const e_z = allocator.dupeZ(u8, e) catch return error.AllocationFailed;
+            envp_list.append(allocator, e_z) catch return error.AllocationFailed;
+        }
+        envp_list.append(allocator, null) catch return error.AllocationFailed;
+        envp_ptr = @ptrCast(envp_list.items.ptr);
+    } else {
+        envp_ptr = @ptrCast(std.c.environ);
+    }
 
     // Execute
-    const err = std.posix.execveZ(cmd_z, @ptrCast(argv.items.ptr), @ptrCast(envp));
+    const err = std.posix.execveZ(cmd_z, @ptrCast(argv.items.ptr), envp_ptr);
     scoped_log.err("execve failed: {}", .{err});
     return error.ExecFailed;
 }

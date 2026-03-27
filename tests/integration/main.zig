@@ -1,7 +1,7 @@
 const std = @import("std");
 
 // Import all modules for integration testing
-const main = @import("../../src/main.zig");
+const main = @import("xenomorph");
 const log = main.log;
 const rootfs_verify = main.rootfs_verify;
 const rootfs_builder = main.rootfs_builder;
@@ -9,8 +9,8 @@ const pivot = main.pivot;
 const process_scanner = main.process_scanner;
 const init_detector = main.init_detector;
 
-/// Integration tests for xenomorph
-/// NOTE: Most of these tests require root privileges and should be run in a VM
+// Integration tests for xenomorph
+// NOTE: Most of these tests require root privileges and should be run in a VM
 
 test "integration: detect init system" {
     const allocator = std.testing.allocator;

@@ -4,6 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // OCI library dependency (../oci)
+    const oci_dep = b.dependency("oci", .{});
+    const oci_module = oci_dep.module("oci");
+
     // Main executable
     const exe = b.addExecutable(.{
         .name = "xenomorph",
@@ -14,6 +18,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    exe.root_module.addImport("oci", oci_module);
 
     b.installArtifact(exe);
 
@@ -28,8 +33,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run xenomorph");
     run_step.dependOn(&run_cmd.step);
 
-    // Unit tests
-    const unit_tests = b.addTest(.{
+    // Inline tests (from src/)
+    const inline_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -37,26 +42,53 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    inline_tests.root_module.addImport("oci", oci_module);
 
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
-
-    // Integration tests (separate step as they require root)
-    const integration_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/integration/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
+    // Unit test suite (from tests/unit/)
+    const unit_module = b.createModule(.{
+        .root_source_file = b.path("tests/unit/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const unit_xenomorph_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    unit_xenomorph_module.addImport("oci", oci_module);
+    unit_module.addImport("xenomorph", unit_xenomorph_module);
+    unit_module.addImport("oci", oci_module);
+    const unit_tests = b.addTest(.{
+        .root_module = unit_module,
     });
 
-    const run_integration_tests = b.addRunArtifact(integration_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(inline_tests).step);
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    // Integration tests (separate step as they require root)
+    const integration_module = b.createModule(.{
+        .root_source_file = b.path("tests/integration/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const integration_xenomorph_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    integration_xenomorph_module.addImport("oci", oci_module);
+    integration_module.addImport("xenomorph", integration_xenomorph_module);
+    const integration_tests = b.addTest(.{
+        .root_module = integration_module,
+    });
 
     const integration_test_step = b.step("test-integration", "Run integration tests (requires root)");
-    integration_test_step.dependOn(&run_integration_tests.step);
+    integration_test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
     // QEMU integration test executable
     const qemu_test_exe = b.addExecutable(.{
@@ -71,7 +103,6 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(qemu_test_exe);
 
-    // Run QEMU test
     const run_qemu_test = b.addRunArtifact(qemu_test_exe);
     run_qemu_test.step.dependOn(b.getInstallStep());
 

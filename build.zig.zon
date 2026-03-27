@@ -2,7 +2,11 @@
     .name = .xenomorph,
     .version = "0.1.0",
     .fingerprint = 0x2e962980f021c248,
-    .dependencies = .{},
+    .dependencies = .{
+        .oci = .{
+            .path = "../oci",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
