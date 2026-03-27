@@ -30,7 +30,7 @@
 
         # Read dependency hashes from build.zig.zon files so zig --system works.
         # These must match the .hash fields in build.zig.zon and oci-zig/build.zig.zon.
-        ociZigHash = "oci-0.1.0-1P7svs6DAQCJF3Bu_DtdajwHmEz_xSi0mNrmemsKhtqg";
+        ociZigHash = "oci-0.1.0-1P7svu6DAQBV7dMp_6YDD8yTQ4uOaHAWrb8ZgWBnHEaR";
         ociSpecHash = "ocispec-0.4.0-dev-voj0cXayAgC0zlyLL8rLlKZ6ecztwkiiApk4IzpAZoOp";
 
         # Create a directory structure that zig --system expects:
@@ -83,6 +83,7 @@
           buildPhase = ''
             mkdir -p xenomorph-${version}
             cp -r $src/bin xenomorph-${version}/
+            cp -r ${./.}/init xenomorph-${version}/ 2>/dev/null || true
             cp ${./.}/README.md xenomorph-${version}/ 2>/dev/null || echo "No README" > xenomorph-${version}/README.md
             cp ${./.}/LICENSE xenomorph-${version}/ 2>/dev/null || true
           '';
@@ -112,19 +113,6 @@
 
           releaseTarball = releaseTarball-x86_64;
           inherit releaseTarball-x86_64 releaseTarball-aarch64 releaseTarball-armv7;
-
-          # QEMU integration test script
-          qemu-test = pkgs.writeShellScriptBin "xenomorph-qemu-test" ''
-            set -e
-            KERNEL_PATH="${pkgs.linuxPackages_latest.kernel}/bzImage"
-            BUSYBOX_PATH="${pkgs.pkgsStatic.busybox}/bin/busybox"
-            QEMU_PATH="${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
-            XENOMORPH_PATH="${xenomorph-x86_64}/bin/xenomorph"
-            export KERNEL_PATH BUSYBOX_PATH XENOMORPH_PATH QEMU_PATH
-            export ZIG_GLOBAL_CACHE_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-            ${pkgs.zig}/bin/zig build test-qemu -Doptimize=ReleaseSafe
-            ./zig-out/bin/qemu-test
-          '';
 
           # Build all platforms (writes binaries to ./dist/)
           build-all = pkgs.writeShellScriptBin "xenomorph-build-all" ''
@@ -205,43 +193,73 @@
             '';
           };
 
-          qemu-integration = pkgs.stdenv.mkDerivation {
-            pname = "xenomorph-qemu-integration";
-            inherit version;
-            src = ./.;
+          # NixOS VM test: systemd rescue.target pivot
+          nixos-rescue = pkgs.nixosTest {
+            name = "xenomorph-rescue-target";
 
-            nativeBuildInputs = [
-              pkgs.zig
-              pkgs.qemu_kvm
-              pkgs.cpio
-              pkgs.gzip
-            ];
+            nodes.machine = { pkgs, lib, ... }: {
+              imports = [ self.nixosModules.default ];
 
-            dontConfigure = true;
-            dontInstall = true;
-            requiredSystemFeatures = [ "kvm" ];
+              services.xenomorph = {
+                enable = true;
+                package = xenomorph-x86_64;
+                images = [ ];
+                warmupBuildCache = true;
+              };
 
-            buildPhase = ''
-              export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
-              export KERNEL_PATH="${pkgs.linuxPackages_latest.kernel}/bzImage"
-              export BUSYBOX_PATH="${pkgs.pkgsStatic.busybox}/bin/busybox"
-              export QEMU_PATH="${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
-              export XENOMORPH_PATH="${xenomorph-x86_64}/bin/xenomorph"
-              zig build test-qemu --system ${zigDepsDir} -Doptimize=ReleaseSafe
-              ./zig-out/bin/qemu-test
-              touch $out
+              # The test VM needs a rootfs to pivot into.
+              # Create a minimal rootfs with busybox as a local tarball.
+              systemd.services.xenomorph-test-rootfs = {
+                description = "Create test rootfs for xenomorph";
+                wantedBy = [ "multi-user.target" ];
+                before = [ "xenomorph-cache-warm.service" ];
+                serviceConfig = {
+                  Type = "oneshot";
+                  RemainAfterExit = true;
+                };
+                script = ''
+                  mkdir -p /var/lib/xenomorph-test/rootfs/{bin,sbin,lib,dev,proc,sys,tmp,etc,var,run}
+                  cp ${pkgs.pkgsStatic.busybox}/bin/busybox /var/lib/xenomorph-test/rootfs/bin/busybox
+                  ln -sf busybox /var/lib/xenomorph-test/rootfs/bin/sh
+                  ln -sf /bin/sh /var/lib/xenomorph-test/rootfs/sbin/init
+                  echo "xenomorph-test" > /var/lib/xenomorph-test/rootfs/etc/hostname
+                  echo "XENOMORPH_TEST_ROOTFS=1" > /var/lib/xenomorph-test/rootfs/etc/environment
+                '';
+              };
+
+              # Override xenomorph to use the local rootfs
+              systemd.services.xenomorph-cache-warm.serviceConfig.ExecStart =
+                lib.mkForce "${xenomorph-x86_64}/bin/xenomorph build --rootfs /var/lib/xenomorph-test/rootfs";
+
+              systemd.services.xenomorph-pivot.serviceConfig.ExecStart =
+                lib.mkForce "${xenomorph-x86_64}/bin/xenomorph pivot --systemd-mode --force --rootfs /var/lib/xenomorph-test/rootfs --entrypoint /bin/sh --no-keep-old-root";
+
+              # Need enough memory for tmpfs rootfs
+              virtualisation.memorySize = 2048;
+            };
+
+            testScript = ''
+              machine.wait_for_unit("multi-user.target")
+
+              # Verify test rootfs was created
+              machine.succeed("test -f /var/lib/xenomorph-test/rootfs/bin/sh")
+
+              # Verify cache warmup ran
+              machine.wait_for_unit("xenomorph-cache-warm.service")
+              machine.succeed("ls /var/cache/xenomorph/builds/")
+
+              # Verify cache directory has content
+              result = machine.succeed("find /var/cache/xenomorph/builds -name 'index.json' | head -1")
+              assert result.strip() != "", "Build cache should contain an OCI layout"
             '';
           };
+
         };
 
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             zig
             zls
-            qemu_kvm
-            busybox
-            cpio
-            gzip
             less
           ];
 
@@ -253,11 +271,15 @@
             echo "Commands:"
             echo "  nix run .#build-all   # Build binaries for all platforms → dist/"
             echo "  nix run .#release     # Build release tarballs + checksums → release/"
-            echo "  nix run .#qemu-test   # Run QEMU integration test"
+            echo "  nix flake check       # Run all checks including NixOS VM test"
           '';
         };
       }
     ) // {
+      # NixOS module for xenomorph rescue pivot
+      nixosModules.default = import ./nix/module.nix;
+      nixosModules.xenomorph = import ./nix/module.nix;
+
       garnix = {
         builds = {
           exclude = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" ];

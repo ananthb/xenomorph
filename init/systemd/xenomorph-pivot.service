@@ -1,0 +1,18 @@
+[Unit]
+Description=Xenomorph rootfs pivot
+Documentation=https://github.com/ananthb/xenomorph
+After=rescue.target
+Wants=network-online.target
+Requires=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/local/bin/xenomorph pivot --systemd-mode --force
+CacheDirectory=xenomorph
+TimeoutStartSec=infinity
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=rescue.target

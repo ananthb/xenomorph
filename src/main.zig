@@ -97,7 +97,7 @@ pub fn main() !void {
             }
             std.debug.print("xenomorph: tailscale up args: {s}\n", .{effective_ts_args});
         }
-        daemonize();
+        daemonize(cfg.log_dir);
     }
 
     runPivot(allocator, &cfg, effective_ts_args) catch |err| {
@@ -129,7 +129,7 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
         };
     }
 
-    // Build effective layer list: user layers + tailscale image if enabled
+    // Build effective layer list
     var effective_layers: std.ArrayListUnmanaged(config.Layer) = .{};
     defer effective_layers.deinit(allocator);
 
@@ -140,9 +140,6 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
     }
     if (effective_layers.items.len == 0) {
         try effective_layers.appendSlice(allocator, cfg.layers);
-    }
-    if (cfg.tailscaleEnabled()) {
-        try effective_layers.append(allocator, .{ .image = tailscale.tailscale_image });
     }
 
     for (effective_layers.items, 0..) |layer, i| {
@@ -165,39 +162,59 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
         }
     }
 
-    // Build rootfs from first layer
-    const first_layer = effective_layers.items[0];
-    switch (first_layer) {
-        .image => |ref| scoped_log.info("Building rootfs from image {s}", .{ref}),
-        .rootfs => |path| scoped_log.info("Building rootfs from {s}", .{path}),
+    // Check build cache
+    const cache_key = try computeBuildCacheKey(allocator, effective_layers.items);
+    const cached_path = checkBuildCache(allocator, cfg.cache_dir, &cache_key);
+    defer if (cached_path) |p| allocator.free(p);
+
+    const use_cache = cached_path != null;
+    if (use_cache) {
+        scoped_log.info("Cache hit: {s}", .{cached_path.?});
     }
-    var builder = rootfs_builder.RootfsBuilder.init(allocator);
-    var build_result = builder.buildFromLayer(first_layer, .{
-        .target_dir = cfg.work_dir,
-        .skip_verify = true, // verify after all merges
-        .tmpfs_headroom = 1.5 + 0.5 * @as(f64, @floatFromInt(effective_layers.items.len - 1)),
-    }) catch |err| {
+
+    // Build rootfs — from cache (single OCI layout) or from scratch (layer-by-layer)
+    if (!use_cache) {
+        switch (effective_layers.items[0]) {
+            .image => |ref| scoped_log.info("Building rootfs from image {s}", .{ref}),
+            .rootfs => |path| scoped_log.info("Building rootfs from {s}", .{path}),
+        }
+    }
+    var builder = rootfs_builder.RootfsBuilder.init(allocator, cfg.cache_dir);
+
+    // If cached, build from the cached OCI layout; otherwise from the first layer
+    const build_result = if (use_cache)
+        builder.buildFromImage(cached_path.?, .{
+            .target_dir = cfg.work_dir,
+            .skip_verify = true,
+            .tmpfs_headroom = 1.5,
+        })
+    else
+        builder.buildFromLayer(effective_layers.items[0], .{
+            .target_dir = cfg.work_dir,
+            .skip_verify = true,
+            .tmpfs_headroom = 1.5 + 0.5 * @as(f64, @floatFromInt(effective_layers.items.len - 1)),
+        });
+
+    var result = build_result catch |err| {
+        if (use_cache) {
+            scoped_log.warn("Cache hit but build failed: {}", .{err});
+        }
         if (err == error.InsufficientMemory) {
             scoped_log.err("Insufficient memory for in-memory rootfs", .{});
-            scoped_log.err("The rootfs must fit entirely in RAM. Try:", .{});
-            scoped_log.err("  - Using a smaller image", .{});
-            scoped_log.err("  - Freeing up memory (stop services, clear caches)", .{});
-            scoped_log.err("  - Adding more RAM to the system", .{});
-            return error.InsufficientMemory;
         }
         return err;
     };
-    defer build_result.deinit(allocator);
-    errdefer build_result.unmountTmpfs();
+    defer result.deinit(allocator);
+    errdefer result.unmountTmpfs();
 
     scoped_log.info("Base rootfs: {} layers, {} bytes", .{
-        build_result.layer_count,
-        build_result.total_size,
+        result.layer_count,
+        result.total_size,
     });
 
     // Thread ImageConfig through the merge loop: subsequent images overwrite on conflict
-    var effective_config: ?rootfs_builder.BuildResult.ImageConfig = build_result.config;
-    build_result.config = null;
+    var effective_config: ?rootfs_builder.BuildResult.ImageConfig = result.config;
+    result.config = null;
     defer {
         if (effective_config) |*ec| {
             if (ec.entrypoint) |ep| {
@@ -216,8 +233,9 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
         }
     }
 
-    // Merge additional layers in order (later overwrites earlier on conflict)
-    for (effective_layers.items[1..]) |layer| {
+    // Merge additional layers in order (skip if using cache — already merged)
+    const layers_to_merge = if (use_cache) effective_layers.items[0..0] else effective_layers.items[1..];
+    for (layers_to_merge) |layer| {
         switch (layer) {
             .image => |ref| scoped_log.info("Merging image {s}", .{ref}),
             .rootfs => |path| scoped_log.info("Merging rootfs {s}", .{path}),
@@ -241,9 +259,9 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
     // Resolve effective entrypoint
     var resolved_cmd: []const u8 = undefined;
     var resolved_args: ?[]const []const u8 = null;
-    if (cfg.exec_cmd_explicit) {
-        resolved_cmd = cfg.exec_cmd;
-        resolved_args = if (cfg.exec_args.len > 0) cfg.exec_args else null;
+    if (cfg.entrypoint_explicit) {
+        resolved_cmd = cfg.entrypoint;
+        resolved_args = if (cfg.command.len > 0) cfg.command else null;
     } else if (effective_config) |ec| {
         if (ec.entrypoint) |ep| {
             if (ep.len > 0) {
@@ -296,16 +314,28 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
         };
     }
 
-    // Build OCI image from the rootfs (for hashing)
+    // Build OCI image for hashing + save to cache
     oci_hash_blk: {
-        const oci_dir = "/tmp/xenomorph-oci";
-        std.fs.deleteTreeAbsolute(oci_dir) catch {};
-        const oci_digest = oci_layout_writer.writeOciLayout(allocator, cfg.work_dir, oci_dir, effective_config) catch |err| {
-            scoped_log.warn("Failed to build OCI image for hashing: {}", .{err});
-            break :oci_hash_blk;
-        };
-        scoped_log.info("OCI image: sha256:{s} ({d} bytes)", .{ &oci_digest.manifest_digest, oci_digest.manifest_size });
-        std.fs.deleteTreeAbsolute(oci_dir) catch {};
+        const oci_dir = std.fmt.allocPrint(allocator, "{s}/builds/{s}", .{ cfg.cache_dir, &cache_key }) catch break :oci_hash_blk;
+        defer allocator.free(oci_dir);
+
+        if (!use_cache) {
+            // Save build to cache
+            saveBuildCache(allocator, cfg.cache_dir, &cache_key, cfg.work_dir, effective_config);
+        }
+
+        // Read back the manifest digest for display
+        var digest_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const index_path = std.fmt.bufPrint(&digest_buf, "{s}/index.json", .{oci_dir}) catch break :oci_hash_blk;
+        const index_file = std.fs.openFileAbsolute(index_path, .{}) catch break :oci_hash_blk;
+        defer index_file.close();
+        var index_buf: [4096]u8 = undefined;
+        const n = index_file.readAll(&index_buf) catch break :oci_hash_blk;
+        // Extract digest from index.json (contains sha256:...)
+        if (std.mem.indexOf(u8, index_buf[0..n], "sha256:")) |start| {
+            const end = std.mem.indexOfScalarPos(u8, index_buf[0..n], start + 7, '"') orelse n;
+            scoped_log.info("OCI image: {s}", .{index_buf[start..end]});
+        }
     }
 
     if (!cfg.skip_verify) {
@@ -348,38 +378,83 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
         scoped_log.info("Tailscale integration configured", .{});
     }
 
-    if (!cfg.no_init_coord and !init_interface.shouldSkipCoordination()) {
-        scoped_log.info("Coordinating with init system", .{});
+    if (cfg.systemd_mode) {
+        scoped_log.info("Systemd mode: skipping init coordination and process termination", .{});
+    } else {
+        if (!cfg.no_init_coord and !init_interface.shouldSkipCoordination()) {
+            scoped_log.info("Coordinating with init system", .{});
 
-        if (init_interface.InitCoordinator.init(allocator)) |coord| {
-            var c = coord;
-            c.timeout_seconds = cfg.timeout;
+            if (init_interface.InitCoordinator.init(allocator)) |coord| {
+                var c = coord;
+                c.timeout_seconds = cfg.timeout;
 
-            c.transitionToRescue() catch |err| {
-                scoped_log.warn("Failed to transition to rescue mode: {}", .{err});
-            };
+                c.transitionToRescue() catch |err| {
+                    scoped_log.warn("Failed to transition to rescue mode: {}", .{err});
+                };
 
-            c.waitForServicesToStop() catch |err| {
-                scoped_log.warn("Timeout waiting for services: {}", .{err});
-            };
+                c.waitForServicesToStop() catch |err| {
+                    scoped_log.warn("Timeout waiting for services: {}", .{err});
+                };
+            } else |err| {
+                scoped_log.warn("Cannot initialize init coordinator: {}", .{err});
+            }
+        }
+
+        scoped_log.info("Terminating non-essential processes", .{});
+        if (process_terminator.terminateAll(allocator, .{
+            .graceful_timeout_ms = cfg.timeout * 1000,
+        })) |term_result| {
+            var r = term_result;
+            scoped_log.info("Terminated {} processes ({} killed)", .{
+                r.terminated_count,
+                r.killed_count,
+            });
+            r.deinit(allocator);
         } else |err| {
-            scoped_log.warn("Cannot initialize init coordinator: {}", .{err});
-            // Continue anyway
+            scoped_log.warn("Process termination failed: {}", .{err});
         }
     }
 
-    scoped_log.info("Terminating non-essential processes", .{});
-    if (process_terminator.terminateAll(allocator, .{
-        .graceful_timeout_ms = cfg.timeout * 1000,
-    })) |result| {
-        var r = result;
-        scoped_log.info("Terminated {} processes ({} killed)", .{
-            r.terminated_count,
-            r.killed_count,
-        });
-        r.deinit(allocator);
-    } else |err| {
-        scoped_log.warn("Process termination failed: {}", .{err});
+    // Check RAM before pivot — rootfs lives in tmpfs (RAM)
+    {
+        const rootfs_size = rootfs_builder.getDirSize(cfg.work_dir, allocator) catch 0;
+        if (memory.getMemInfo()) |mem_info| {
+            const available = mem_info.available;
+            const total = mem_info.total;
+            const used_pct = if (total > 0) (total - available) * 100 / total else 0;
+
+            scoped_log.info("Rootfs size: {d}MB, RAM available: {d}MB/{d}MB ({d}% used)", .{
+                rootfs_size / (1024 * 1024),
+                available / (1024 * 1024),
+                total / (1024 * 1024),
+                used_pct,
+            });
+
+            // Error if less than 10% RAM would remain after accounting for rootfs
+            const headroom = if (available > rootfs_size) available - rootfs_size else 0;
+            const min_headroom = total / 10; // 10% of total
+            if (headroom < min_headroom) {
+                scoped_log.err("Insufficient RAM: rootfs uses {d}MB but only {d}MB available ({d}MB total)", .{
+                    rootfs_size / (1024 * 1024),
+                    available / (1024 * 1024),
+                    total / (1024 * 1024),
+                });
+                scoped_log.err("The system needs at least 10% free RAM after pivot to function", .{});
+                return error.InsufficientMemory;
+            }
+
+            // Warn if less than 25% would remain
+            const warn_headroom = total / 4; // 25% of total
+            if (headroom < warn_headroom) {
+                scoped_log.warn("Low RAM: only {d}MB will remain free after pivot ({d}MB rootfs, {d}MB available)", .{
+                    headroom / (1024 * 1024),
+                    rootfs_size / (1024 * 1024),
+                    available / (1024 * 1024),
+                });
+            }
+        } else |_| {
+            scoped_log.warn("Cannot read memory info, skipping RAM check", .{});
+        }
     }
 
     scoped_log.info("Preparing pivot", .{});
@@ -422,14 +497,14 @@ fn dryRun(allocator: std.mem.Allocator, cfg: *const config.Config, effective_ts_
         };
         if (i == 0) {
             try stdout.print("  {}: {s} ({s}, base)\n", .{ i + 1, label, kind });
-        } else if (cfg.tailscaleEnabled() and layer == .image and std.mem.eql(u8, layer.image, tailscale.tailscale_image)) {
+        } else if (layer == .image and std.mem.indexOf(u8, layer.image, "tailscale") != null) {
             try stdout.print("  {}: {s} ({s}, tailscale)\n", .{ i + 1, label, kind });
         } else {
             try stdout.print("  {}: {s} ({s})\n", .{ i + 1, label, kind });
         }
     }
 
-    try stdout.print("\nExec command: {s}\n", .{cfg.exec_cmd});
+    try stdout.print("\nEntrypoint: {s}\n", .{cfg.entrypoint});
     try stdout.print("Old root mount: {s}\n", .{cfg.keep_old_root});
     try stdout.print("Timeout: {}s\n", .{cfg.timeout});
     if (cfg.headless) {
@@ -478,7 +553,7 @@ fn dryRun(allocator: std.mem.Allocator, cfg: *const config.Config, effective_ts_
     step += 1;
     try stdout.print("  {}. Execute pivot_root\n", .{step});
     step += 1;
-    try stdout.print("  {}. Execute {s}\n", .{ step, cfg.exec_cmd });
+    try stdout.print("  {}. Execute {s}\n", .{ step, cfg.entrypoint });
 
     try stdout.print("\n=== END DRY RUN ===\n", .{});
 }
@@ -523,7 +598,7 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         };
     }
 
-    // Build effective layer list (with tailscale if enabled)
+    // Build effective layer list
     var effective_layers: std.ArrayListUnmanaged(config.Layer) = .{};
     defer effective_layers.deinit(allocator);
 
@@ -535,9 +610,6 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     if (effective_layers.items.len == 0) {
         try effective_layers.appendSlice(allocator, cfg.layers);
     }
-    if (cfg.tailscaleEnabled()) {
-        try effective_layers.append(allocator, .{ .image = tailscale.tailscale_image });
-    }
 
     for (effective_layers.items, 0..) |layer, i| {
         switch (layer) {
@@ -547,7 +619,7 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     }
 
     // Build rootfs from first layer
-    var builder = rootfs_builder.RootfsBuilder.init(allocator);
+    var builder = rootfs_builder.RootfsBuilder.init(allocator, cfg.cache_dir);
     var build_result = builder.buildFromLayer(effective_layers.items[0], .{
         .target_dir = cfg.work_dir,
         .skip_verify = true,
@@ -610,10 +682,17 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         try injector.createStartupScript(cfg.work_dir);
     }
 
-    // Write OCI layout
-    scoped_log.info("Writing OCI layout to {s}", .{cfg.output});
-    const oci_digest = try oci_layout_writer.writeOciLayout(allocator, cfg.work_dir, cfg.output, effective_config);
-    scoped_log.info("OCI image: sha256:{s}", .{&oci_digest.manifest_digest});
+    // Save to cache
+    const cache_key = try computeBuildCacheKey(allocator, effective_layers.items);
+    saveBuildCache(allocator, cfg.cache_dir, &cache_key, cfg.work_dir, effective_config);
+    scoped_log.info("Cached build: {s}", .{&cache_key});
+
+    // Write OCI layout to output if requested
+    if (cfg.output) |output_path| {
+        scoped_log.info("Writing OCI layout to {s}", .{output_path});
+        const oci_digest = try oci_layout_writer.writeOciLayout(allocator, cfg.work_dir, output_path, effective_config);
+        scoped_log.info("OCI image: sha256:{s}", .{&oci_digest.manifest_digest});
+    }
 
     // Optionally write rootfs tarball
     if (cfg.rootfs_output) |rootfs_path| {
@@ -640,7 +719,7 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     }
 
     // Entrypoint validation (warning only for generate)
-    if (!cfg.exec_cmd_explicit) {
+    if (!cfg.entrypoint_explicit) {
         const has_entrypoint = if (effective_config) |ec|
             (ec.entrypoint != null and ec.entrypoint.?.len > 0) or
                 (ec.cmd != null and ec.cmd.?.len > 0)
@@ -659,7 +738,11 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         }
     }
 
-    scoped_log.info("Generated {s}", .{cfg.output});
+    if (cfg.output) |output_path| {
+        scoped_log.info("Generated {s}", .{output_path});
+    } else {
+        scoped_log.info("Build cached (no output requested)", .{});
+    }
 }
 
 const ContainerfileResult = struct {
@@ -878,6 +961,70 @@ fn mergeImageConfig(
 /// Resolve the effective tailscale up arguments.
 /// If the user provided --tailscale-args, use that.
 /// Otherwise, generate a default: --ssh --hostname=<hostname>-xenomorph
+/// Compute a cache key from the effective layer list.
+/// The key is a sha256 of the normalized layer descriptions.
+fn computeBuildCacheKey(allocator: std.mem.Allocator, layers: []const config.Layer) ![64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+
+    for (layers) |layer| {
+        switch (layer) {
+            .image => |ref| {
+                hasher.update("image:");
+                const normalized = config.normalizeImageRef(allocator, ref) catch ref;
+                defer if (normalized.ptr != ref.ptr) allocator.free(normalized);
+                hasher.update(normalized);
+            },
+            .rootfs => |path| {
+                hasher.update("rootfs:");
+                hasher.update(path);
+            },
+        }
+        hasher.update("\n");
+    }
+
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// Check if a build with the given cache key exists.
+/// Returns the path to the cached OCI layout directory, or null.
+fn checkBuildCache(allocator: std.mem.Allocator, cache_dir: []const u8, key: []const u8) ?[]const u8 {
+    const cache_path = std.fmt.allocPrint(allocator, "{s}/builds/{s}", .{ cache_dir, key }) catch return null;
+
+    // Check if index.json exists in the cached build
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = std.fmt.bufPrint(&buf, "{s}/index.json", .{cache_path}) catch {
+        allocator.free(cache_path);
+        return null;
+    };
+
+    std.fs.accessAbsolute(index_path, .{}) catch {
+        allocator.free(cache_path);
+        return null;
+    };
+
+    return cache_path;
+}
+
+/// Save a built rootfs as a cached OCI layout.
+fn saveBuildCache(allocator: std.mem.Allocator, cache_dir: []const u8, key: []const u8, rootfs_dir: []const u8, image_config: ?rootfs_builder.BuildResult.ImageConfig) void {
+    const cache_path = std.fmt.allocPrint(allocator, "{s}/builds/{s}", .{ cache_dir, key }) catch return;
+    defer allocator.free(cache_path);
+
+    // Ensure cache directory structure exists
+    {
+        var dir = std.fs.openDirAbsolute(cache_dir, .{}) catch return;
+        defer dir.close();
+        dir.makePath("builds") catch return;
+    }
+
+    // Write OCI layout to cache
+    _ = oci_layout_writer.writeOciLayout(allocator, rootfs_dir, cache_path, image_config) catch |err| {
+        scoped_log.warn("Failed to save build cache: {}", .{err});
+    };
+}
+
 fn resolveTailscaleArgs(allocator: std.mem.Allocator, cfg: *const config.Config) []const u8 {
     if (!cfg.tailscaleEnabled()) return "--ssh";
     if (cfg.tailscale_args) |args| return args;
@@ -897,12 +1044,15 @@ fn resolveTailscaleArgs(allocator: std.mem.Allocator, cfg: *const config.Config)
 /// Fork and detach from the controlling terminal.
 /// The parent prints the child PID and log path, then exits immediately.
 /// The child continues in a new session with stderr redirected to a log file.
-fn daemonize() void {
+fn daemonize(log_dir: []const u8) void {
     const linux = std.os.linux;
-    const headless_log = "/var/log/xenomorph.log";
+
+    // Build log path
+    var log_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const headless_log = std.fmt.bufPrint(&log_path_buf, "{s}/xenomorph.log", .{log_dir}) catch "/var/log/xenomorph.log";
 
     // Ensure log directory exists
-    std.fs.makeDirAbsolute("/var/log") catch {};
+    std.fs.makeDirAbsolute(log_dir) catch {};
 
     // Open log file (create/truncate, write-only)
     const log_fd = std.posix.open(

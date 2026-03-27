@@ -8,10 +8,6 @@ pub const TailscaleError = error{
     OutOfMemory,
 };
 
-/// The OCI image that provides tailscale/tailscaled binaries.
-/// Automatically appended to the image list when tailscale is enabled.
-pub const tailscale_image = "docker.io/tailscale/tailscale:latest";
-
 /// Creates the Tailscale startup wrapper script in a rootfs.
 /// The tailscale binaries themselves come from merging the tailscale OCI image.
 pub const TailscaleInjector = struct {

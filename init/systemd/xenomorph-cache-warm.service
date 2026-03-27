@@ -1,0 +1,14 @@
+[Unit]
+Description=Xenomorph cache pre-warm
+Documentation=https://github.com/ananthb/xenomorph
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xenomorph build
+CacheDirectory=xenomorph
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

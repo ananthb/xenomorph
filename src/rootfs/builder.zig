@@ -95,17 +95,10 @@ pub const RootfsBuilder = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator, cache_dir: []const u8) Self {
         return Self{
             .allocator = allocator,
-            .cache = oci_cache.LayerCache.init(allocator),
-        };
-    }
-
-    pub fn initWithCache(allocator: std.mem.Allocator, cache_dir: []const u8) Self {
-        return Self{
-            .allocator = allocator,
-            .cache = oci_cache.LayerCache.initWithDir(allocator, cache_dir),
+            .cache = oci_cache.LayerCache.init(allocator, cache_dir),
         };
     }
 
@@ -705,7 +698,7 @@ pub fn verifyRootfs(path: []const u8, allocator: std.mem.Allocator) !bool {
 }
 
 /// Get directory size recursively
-fn getDirSize(path: []const u8, allocator: std.mem.Allocator) !u64 {
+pub fn getDirSize(path: []const u8, allocator: std.mem.Allocator) !u64 {
     _ = allocator;
 
     var total: u64 = 0;

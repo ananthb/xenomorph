@@ -21,11 +21,11 @@ pub const Config = struct {
     /// Ordered list of layers to merge into the rootfs (later wins on conflict)
     layers: []const Layer = &.{.{ .image = "docker.io/library/alpine:latest" }},
 
-    /// Command to execute post-pivot
-    exec_cmd: []const u8 = "/bin/sh",
+    /// Entrypoint command for the new rootfs
+    entrypoint: []const u8 = "/bin/sh",
 
-    /// Arguments for exec command
-    exec_args: []const []const u8 = &.{},
+    /// Command/arguments passed to entrypoint
+    command: []const []const u8 = &.{},
 
     /// Mount point for old root
     keep_old_root: []const u8 = "/mnt/oldroot",
@@ -38,6 +38,10 @@ pub const Config = struct {
 
     /// Skip init system coordination
     no_init_coord: bool = false,
+
+    /// Systemd service mode: skip init coordination and process termination
+    /// (assumes systemd has already isolated to rescue.target)
+    systemd_mode: bool = false,
 
     /// Verbose output
     verbose: bool = false,
@@ -60,14 +64,17 @@ pub const Config = struct {
     /// Working directory for extraction
     work_dir: []const u8 = "/var/lib/xenomorph/rootfs",
 
-    /// Output path for generate subcommand (OCI layout directory)
-    output: []const u8 = "rootfs.oci",
+    /// Log directory (used by headless mode)
+    log_dir: []const u8 = "/var/log",
+
+    /// Output path for build subcommand (null = cache only, no output)
+    output: ?[]const u8 = null,
 
     /// Optional additional rootfs tarball output for generate
     rootfs_output: ?[]const u8 = null,
 
-    /// Whether --exec was explicitly set by the user
-    exec_cmd_explicit: bool = false,
+    /// Whether --entrypoint was explicitly set by the user
+    entrypoint_explicit: bool = false,
 
     /// Headless mode: fork, detach from terminal, log to file.
     /// Survives SSH disconnection. Implies --force.
@@ -79,18 +86,17 @@ pub const Config = struct {
     /// Build context directory (default: directory containing containerfile)
     context: ?[]const u8 = null,
 
-    /// Enable Tailscale integration (set implicitly by --tailscale-authkey)
-    tailscale: ?bool = null,
+    /// Tailscale OCI image (added to layers when any --tailscale-* flag is used)
+    tailscale_image: []const u8 = "docker.io/tailscale/tailscale:latest",
 
-    /// Tailscale auth key (implies --tailscale)
+    /// Tailscale auth key (triggers tailscaled start + tailscale up in init script)
     tailscale_authkey: ?[]const u8 = null,
 
     /// Arguments for 'tailscale up' (null = auto-generate with --ssh --hostname)
     tailscale_args: ?[]const u8 = null,
 
-    /// Check if tailscale integration is effectively enabled
+    /// Check if tailscale init script should be created
     pub fn tailscaleEnabled(self: *const Config) bool {
-        if (self.tailscale) |ts| return ts;
         return self.tailscale_authkey != null;
     }
 
@@ -138,23 +144,33 @@ pub fn parseArgs(allocator: std.mem.Allocator) !?Config {
     }
 }
 
+fn applyCacheDirEnv(cfg: *Config) void {
+    const env_val = std.posix.getenv("CACHE_DIRECTORY");
+    if (env_val) |dir| {
+        cfg.cache_dir = dir;
+    }
+}
+
 fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
     var cfg = Config{};
+    applyCacheDirEnv(&cfg);
 
     var layers_list: std.ArrayListUnmanaged(Layer) = .{};
     defer layers_list.deinit(std.heap.page_allocator);
 
-    var exec_args_list: std.ArrayListUnmanaged([]const u8) = .{};
-    defer exec_args_list.deinit(std.heap.page_allocator);
+    var command_list: std.ArrayListUnmanaged([]const u8) = .{};
+    defer command_list.deinit(std.heap.page_allocator);
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--image")) {
             try layers_list.append(std.heap.page_allocator, .{ .image = args.next() orelse return error.MissingValue });
         } else if (std.mem.eql(u8, arg, "--rootfs")) {
             try layers_list.append(std.heap.page_allocator, .{ .rootfs = args.next() orelse return error.MissingValue });
-        } else if (std.mem.eql(u8, arg, "--exec")) {
-            cfg.exec_cmd = args.next() orelse return error.MissingValue;
-            cfg.exec_cmd_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--entrypoint")) {
+            cfg.entrypoint = args.next() orelse return error.MissingValue;
+            cfg.entrypoint_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--command") or std.mem.eql(u8, arg, "--cmd")) {
+            try command_list.append(std.heap.page_allocator, args.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, arg, "--keep-old-root")) {
             cfg.keep_old_root = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
@@ -178,6 +194,12 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
             cfg.cache_dir = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--work-dir")) {
             cfg.work_dir = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--log-dir")) {
+            cfg.log_dir = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--systemd-mode")) {
+            cfg.systemd_mode = true;
+            cfg.no_init_coord = true;
+            cfg.force = true;
         } else if (std.mem.eql(u8, arg, "--headless")) {
             cfg.headless = true;
             cfg.force = true;
@@ -185,18 +207,20 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
             cfg.containerfile = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--context")) {
             cfg.context = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--tailscale") or std.mem.eql(u8, arg, "--tailscale=true")) {
-            cfg.tailscale = true;
-        } else if (std.mem.eql(u8, arg, "--tailscale=false") or std.mem.eql(u8, arg, "--no-tailscale")) {
-            cfg.tailscale = false;
+        } else if (std.mem.eql(u8, arg, "--tailscale-image")) {
+            cfg.tailscale_image = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--tailscale-authkey")) {
+            if (cfg.tailscale_authkey != null) {
+                std.debug.print("Error: --tailscale-authkey may only be specified once\n", .{});
+                return error.DuplicateOption;
+            }
             cfg.tailscale_authkey = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--tailscale-args")) {
             cfg.tailscale_args = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--")) {
-            // Everything after -- is exec args
-            while (args.next()) |exec_arg| {
-                try exec_args_list.append(std.heap.page_allocator, exec_arg);
+            // Everything after -- is command args
+            while (args.next()) |cmd_arg| {
+                try command_list.append(std.heap.page_allocator, cmd_arg);
             }
         } else {
             std.debug.print("Unknown option: {s}\n", .{arg});
@@ -204,12 +228,19 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
         }
     }
 
-    if (layers_list.items.len > 0) {
-        cfg.layers = try layers_list.toOwnedSlice(std.heap.page_allocator);
+    // Any tailscale flag adds the tailscale image as the last layer
+    if (cfg.tailscale_authkey != null or cfg.tailscale_args != null or
+        !std.mem.eql(u8, cfg.tailscale_image, "docker.io/tailscale/tailscale:latest"))
+    {
+        try layers_list.append(std.heap.page_allocator, .{ .image = cfg.tailscale_image });
     }
 
-    if (exec_args_list.items.len > 0) {
-        cfg.exec_args = try exec_args_list.toOwnedSlice(std.heap.page_allocator);
+    if (layers_list.items.len > 0) {
+        cfg.layers = try deduplicateLayers(std.heap.page_allocator, &layers_list);
+    }
+
+    if (command_list.items.len > 0) {
+        cfg.command = try command_list.toOwnedSlice(std.heap.page_allocator);
     }
 
     return cfg;
@@ -217,6 +248,7 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
 
 fn parseBuildArgs(args: *std.process.ArgIterator) !Config {
     var cfg = Config{ .subcommand = .build };
+    applyCacheDirEnv(&cfg);
 
     var layers_list: std.ArrayListUnmanaged(Layer) = .{};
     defer layers_list.deinit(std.heap.page_allocator);
@@ -238,9 +270,13 @@ fn parseBuildArgs(args: *std.process.ArgIterator) !Config {
             cfg.containerfile = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--context")) {
             cfg.context = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--tailscale") or std.mem.eql(u8, arg, "--tailscale=true")) {
-            cfg.tailscale = true;
+        } else if (std.mem.eql(u8, arg, "--tailscale-image")) {
+            cfg.tailscale_image = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--tailscale-authkey")) {
+            if (cfg.tailscale_authkey != null) {
+                std.debug.print("Error: --tailscale-authkey may only be specified once\n", .{});
+                return error.DuplicateOption;
+            }
             cfg.tailscale_authkey = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--tailscale-args")) {
             cfg.tailscale_args = args.next() orelse return error.MissingValue;
@@ -250,11 +286,107 @@ fn parseBuildArgs(args: *std.process.ArgIterator) !Config {
         }
     }
 
+    // Any tailscale flag adds the tailscale image as the last layer
+    if (cfg.tailscale_authkey != null or cfg.tailscale_args != null or
+        !std.mem.eql(u8, cfg.tailscale_image, "docker.io/tailscale/tailscale:latest"))
+    {
+        try layers_list.append(std.heap.page_allocator, .{ .image = cfg.tailscale_image });
+    }
+
     if (layers_list.items.len > 0) {
-        cfg.layers = try layers_list.toOwnedSlice(std.heap.page_allocator);
+        cfg.layers = try deduplicateLayers(std.heap.page_allocator, &layers_list);
     }
 
     return cfg;
+}
+
+/// Remove duplicate layers, keeping the last occurrence of each.
+/// Image references are normalized before comparison (alpine = docker.io/library/alpine:latest).
+/// Rootfs paths are compared as-is.
+fn deduplicateLayers(allocator: std.mem.Allocator, layers: *std.ArrayListUnmanaged(Layer)) ![]const Layer {
+    var seen: std.StringHashMapUnmanaged(void) = .{};
+    defer seen.deinit(allocator);
+
+    // Temp storage for normalized keys we allocate
+    var key_storage: std.ArrayListUnmanaged([]const u8) = .{};
+    defer {
+        for (key_storage.items) |k| allocator.free(k);
+        key_storage.deinit(allocator);
+    }
+
+    var deduped: std.ArrayListUnmanaged(Layer) = .{};
+    defer deduped.deinit(allocator);
+
+    // Walk backwards so last occurrence wins position
+    var i: usize = layers.items.len;
+    while (i > 0) {
+        i -= 1;
+        const layer = layers.items[i];
+        const key = switch (layer) {
+            .image => |ref| blk: {
+                const normalized = normalizeImageRef(allocator, ref) catch ref;
+                if (normalized.ptr != ref.ptr) {
+                    try key_storage.append(allocator, normalized);
+                }
+                break :blk normalized;
+            },
+            .rootfs => |path| path,
+        };
+        if (!seen.contains(key)) {
+            try seen.put(allocator, key, {});
+            try deduped.append(allocator, layer);
+        }
+    }
+
+    std.mem.reverse(Layer, deduped.items);
+    return deduped.toOwnedSlice(allocator);
+}
+
+/// Normalize an OCI image reference to canonical form: registry/repository:tag
+/// e.g. "alpine" → "registry-1.docker.io/library/alpine:latest"
+pub fn normalizeImageRef(allocator: std.mem.Allocator, ref: []const u8) ![]const u8 {
+    const default_registry = "registry-1.docker.io";
+
+    var remaining = ref;
+    var registry: []const u8 = default_registry;
+    var tag: []const u8 = "latest";
+
+    // Strip digest (@sha256:...) — not relevant for dedup
+    if (std.mem.indexOf(u8, remaining, "@")) |idx| {
+        remaining = remaining[0..idx];
+    }
+
+    // Extract tag after last ':'
+    if (std.mem.lastIndexOfScalar(u8, remaining, ':')) |idx| {
+        const potential_tag = remaining[idx + 1 ..];
+        // Make sure it's not a port (no '/' in tag)
+        if (std.mem.indexOf(u8, potential_tag, "/") == null) {
+            tag = potential_tag;
+            remaining = remaining[0..idx];
+        }
+    }
+
+    // Extract registry (contains '.' or ':' or is 'localhost')
+    if (std.mem.indexOf(u8, remaining, "/")) |first_slash| {
+        const potential_registry = remaining[0..first_slash];
+        if (std.mem.indexOf(u8, potential_registry, ".") != null or
+            std.mem.indexOf(u8, potential_registry, ":") != null or
+            std.mem.eql(u8, potential_registry, "localhost"))
+        {
+            registry = potential_registry;
+            remaining = remaining[first_slash + 1 ..];
+        }
+    }
+
+    // Docker Hub library images: "alpine" → "library/alpine"
+    const repository: []const u8 = remaining;
+    if (std.mem.eql(u8, registry, default_registry) and
+        std.mem.indexOf(u8, remaining, "/") == null)
+    {
+        return std.fmt.allocPrint(allocator, "{s}/library/{s}:{s}", .{ registry, remaining, tag });
+    }
+
+    return std.fmt.allocPrint(allocator, "{s}/{s}:{s}", .{ registry, repository, tag });
 }
 
 fn printUsage() void {
@@ -270,7 +402,9 @@ fn printUsage() void {
         \\                              (default: --image docker.io/library/alpine:latest)
         \\
         \\OPTIONS:
-        \\    --exec <cmd>              Command to execute post-pivot (default: /bin/sh)
+        \\    --entrypoint <cmd>        Entrypoint for the new rootfs (default: from image or /bin/sh)
+        \\    --command, --cmd <arg>    Command/args passed to entrypoint (repeatable)
+        \\    -- <args>...              Arguments passed as command (alternative to --command)
         \\    --keep-old-root <path>    Mount point for old root (default: /mnt/oldroot)
         \\    --no-keep-old-root        Don't keep old root accessible
         \\    -f, --force               Skip confirmation prompts
@@ -279,20 +413,20 @@ fn printUsage() void {
         \\    --skip-verify             Skip rootfs verification
         \\    --cache-dir <path>        Cache directory for OCI layers
         \\    --work-dir <path>         Working directory for extraction
+        \\    --log-dir <path>          Log directory for headless mode (default: /var/log)
         \\    -v, --verbose             Verbose output
         \\    -n, --dry-run             Show what would be done without executing
+        \\    --systemd-mode            Running as systemd unit (skip init coord + kill)
         \\    --headless                Detach from terminal (survives SSH disconnect)
         \\    --containerfile <path>    Build from Containerfile/Dockerfile
         \\    --dockerfile <path>       Alias for --containerfile
         \\    --context <dir>           Build context directory (default: containerfile dir)
-        \\    -- <args>...              Arguments to pass to exec command
         \\
         \\TAILSCALE:
-        \\    --tailscale-authkey <key> Tailscale auth key (enables Tailscale integration)
+        \\    --tailscale-authkey <key> Starts tailscale inside the new rootfs
+        \\    --tailscale-image <ref>   Tailscale image (default: docker.io/tailscale/tailscale:latest)
         \\    --tailscale-args <args>   Arguments for 'tailscale up'
         \\                              (default: --ssh --hostname=<hostname>-xenomorph)
-        \\    --tailscale               Explicitly enable Tailscale
-        \\    --no-tailscale            Disable Tailscale (overrides --tailscale-authkey)
         \\
         \\EXAMPLES:
         \\    # Pivot to alpine (default)
@@ -309,7 +443,7 @@ fn printUsage() void {
         \\
         \\BUILD:
         \\    xenomorph build [--image <ref>...] [--rootfs <path>...] [-o <dir>]
-        \\    -o, --output <dir>        Output OCI layout directory (default: rootfs.oci)
+        \\    -o, --output <dir>        Output OCI layout directory (omit to cache only)
         \\    --rootfs-output <file>    Also write a rootfs tarball
         \\
         \\SUBCOMMANDS:
@@ -354,7 +488,7 @@ fn parseConfigFile(allocator: std.mem.Allocator, content: []const u8) !Config {
             if (std.mem.eql(u8, key, "image")) {
                 cfg.layers = &.{.{ .image = value }};
             } else if (std.mem.eql(u8, key, "exec")) {
-                cfg.exec_cmd = value;
+                cfg.entrypoint = value;
             } else if (std.mem.eql(u8, key, "keep_old_root")) {
                 cfg.keep_old_root = value;
             } else if (std.mem.eql(u8, key, "timeout")) {
@@ -376,9 +510,13 @@ pub fn validate(cfg: *const Config) !void {
         return error.InvalidTimeout;
     }
 
-    if (cfg.tailscaleEnabled() and cfg.tailscale_authkey == null) {
-        std.debug.print("Error: --tailscale requires --tailscale-authkey\n", .{});
-        return error.TailscaleMissingAuthkey;
+    if (cfg.tailscale_authkey == null) {
+        if (cfg.tailscale_args != null) {
+            std.debug.print("Warning: --tailscale-args without --tailscale-authkey won't start tailscale\n", .{});
+        }
+        if (!std.mem.eql(u8, cfg.tailscale_image, "docker.io/tailscale/tailscale:latest")) {
+            std.debug.print("Warning: --tailscale-image without --tailscale-authkey won't start tailscale\n", .{});
+        }
     }
 
     if (cfg.headless and !cfg.tailscaleEnabled()) {
@@ -393,10 +531,51 @@ test "default config" {
     const testing = std.testing;
     try testing.expectEqual(@as(usize, 1), cfg.layers.len);
     try testing.expectEqualStrings("docker.io/library/alpine:latest", cfg.layers[0].image);
-    try testing.expectEqualStrings("/bin/sh", cfg.exec_cmd);
+    try testing.expectEqualStrings("/bin/sh", cfg.entrypoint);
     try testing.expectEqualStrings("/mnt/oldroot", cfg.keep_old_root);
     try testing.expectEqual(@as(u32, 30), cfg.timeout);
-    try testing.expectEqualStrings("rootfs.oci", cfg.output);
-    try testing.expect(!cfg.exec_cmd_explicit);
+    try testing.expect(cfg.output == null);
+    try testing.expect(!cfg.entrypoint_explicit);
     try testing.expect(cfg.rootfs_output == null);
+}
+
+test "normalizeImageRef" {
+    const t = std.testing;
+
+    // Simple name → full canonical form
+    {
+        const n = try normalizeImageRef(t.allocator, "alpine");
+        defer t.allocator.free(n);
+        try t.expectEqualStrings("registry-1.docker.io/library/alpine:latest", n);
+    }
+
+    // Name with tag
+    {
+        const n = try normalizeImageRef(t.allocator, "alpine:3.18");
+        defer t.allocator.free(n);
+        try t.expectEqualStrings("registry-1.docker.io/library/alpine:3.18", n);
+    }
+
+    // docker.io short form
+    {
+        const n = try normalizeImageRef(t.allocator, "docker.io/library/alpine");
+        defer t.allocator.free(n);
+        try t.expectEqualStrings("docker.io/library/alpine:latest", n);
+    }
+
+    // Full form with tag is stable
+    {
+        const n = try normalizeImageRef(t.allocator, "ghcr.io/user/repo:v1.0");
+        defer t.allocator.free(n);
+        try t.expectEqualStrings("ghcr.io/user/repo:v1.0", n);
+    }
+
+    // All alpine variants normalize to equivalent
+    {
+        const a = try normalizeImageRef(t.allocator, "alpine");
+        defer t.allocator.free(a);
+        const b = try normalizeImageRef(t.allocator, "library/alpine:latest");
+        defer t.allocator.free(b);
+        try t.expectEqualStrings(a, b);
+    }
 }

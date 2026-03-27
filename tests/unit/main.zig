@@ -83,7 +83,7 @@ test "unit: namespace types" {
 
 test "unit: layer cache path generation" {
     const allocator = std.testing.allocator;
-    var layer_cache = xeno.oci_cache.LayerCache.initWithDir(allocator, "/var/cache/test");
+    var layer_cache = xeno.oci_cache.LayerCache.init(allocator, "/var/cache/test");
     const path = try layer_cache.getLayerPath("sha256:abc123def456");
     defer allocator.free(path);
     try std.testing.expectEqualStrings("/var/cache/test/blobs/sha256/abc123def456", path);
@@ -97,14 +97,14 @@ test "unit: config defaults" {
 
     try t.expectEqual(@as(usize, 1), cfg.layers.len);
     try t.expectEqualStrings("docker.io/library/alpine:latest", cfg.layers[0].image);
-    try t.expectEqualStrings("/bin/sh", cfg.exec_cmd);
+    try t.expectEqualStrings("/bin/sh", cfg.entrypoint);
     try t.expectEqualStrings("/mnt/oldroot", cfg.keep_old_root);
     try t.expectEqual(@as(u32, 30), cfg.timeout);
     try t.expect(!cfg.force);
     try t.expect(!cfg.verbose);
     try t.expect(!cfg.dry_run);
-    try t.expect(!cfg.exec_cmd_explicit);
-    try t.expectEqualStrings("rootfs.oci", cfg.output);
+    try t.expect(!cfg.entrypoint_explicit);
+    try t.expect(cfg.output == null);
     try t.expect(cfg.rootfs_output == null);
 }
 
@@ -121,10 +121,12 @@ test "unit: tailscale enabled logic" {
     const t = std.testing;
     const C = config_mod.Config;
 
+    // No authkey = not enabled
     try t.expect(!(C{}).tailscaleEnabled());
+    // Authkey = enabled (init script will be created)
     try t.expect((C{ .tailscale_authkey = "tskey-auth-x" }).tailscaleEnabled());
-    try t.expect(!(C{ .tailscale = false, .tailscale_authkey = "tskey-auth-x" }).tailscaleEnabled());
-    try t.expect((C{ .tailscale = true }).tailscaleEnabled());
+    // No authkey = not enabled (--tailscale just adds the image layer)
+    try t.expect(!(C{ .tailscale_authkey = null }).tailscaleEnabled());
 }
 
 test "unit: subcommand types" {
