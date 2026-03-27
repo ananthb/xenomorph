@@ -4,9 +4,17 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    oci-zig = {
+      url = "github:ananthb/oci-zig";
+      flake = false;
+    };
+    oci-spec-zig = {
+      url = "github:ananthb/oci-spec-zig/zig-0.15-compat";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, oci-zig, oci-spec-zig }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -19,6 +27,19 @@
           aarch64 = "aarch64-linux-musl";
           armv7 = "arm-linux-musleabihf";
         };
+
+        # Read dependency hashes from build.zig.zon files so zig --system works.
+        # These must match the .hash fields in build.zig.zon and oci-zig/build.zig.zon.
+        ociZigHash = "oci-0.1.0-1P7svs6DAQCJF3Bu_DtdajwHmEz_xSi0mNrmemsKhtqg";
+        ociSpecHash = "ocispec-0.4.0-dev-voj0cXayAgC0zlyLL8rLlKZ6ecztwkiiApk4IzpAZoOp";
+
+        # Create a directory structure that zig --system expects:
+        # pkgdir/<hash> → source tree
+        zigDepsDir = pkgs.runCommand "xenomorph-zig-deps" {} ''
+          mkdir -p $out
+          ln -s ${oci-zig} $out/${ociZigHash}
+          ln -s ${oci-spec-zig} $out/${ociSpecHash}
+        '';
 
         # Build a static xenomorph for a given target
         mkXenomorph = name: zigTarget: pkgs.stdenv.mkDerivation {
@@ -33,10 +54,12 @@
 
           buildPhase = ''
             runHook preBuild
-
             export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
-            zig build -Doptimize=ReleaseSafe -Dtarget=${zigTarget} --prefix $out
-
+            zig build \
+              --system ${zigDepsDir} \
+              -Doptimize=ReleaseSafe \
+              -Dtarget=${zigTarget} \
+              --prefix $out
             runHook postBuild
           '';
 
@@ -82,79 +105,106 @@
       in
       {
         packages = {
-          # Default is x86_64 static build
           default = xenomorph-x86_64;
           xenomorph = xenomorph-x86_64;
 
-          # All architecture builds
           inherit xenomorph-x86_64 xenomorph-aarch64 xenomorph-armv7;
 
-          # Release tarballs
           releaseTarball = releaseTarball-x86_64;
           inherit releaseTarball-x86_64 releaseTarball-aarch64 releaseTarball-armv7;
 
           # QEMU integration test script
           qemu-test = pkgs.writeShellScriptBin "xenomorph-qemu-test" ''
             set -e
-
             KERNEL_PATH="${pkgs.linuxPackages_latest.kernel}/bzImage"
             BUSYBOX_PATH="${pkgs.pkgsStatic.busybox}/bin/busybox"
             QEMU_PATH="${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
             XENOMORPH_PATH="${xenomorph-x86_64}/bin/xenomorph"
-
             export KERNEL_PATH BUSYBOX_PATH XENOMORPH_PATH QEMU_PATH
-
-            # Set up Zig cache directory
             export ZIG_GLOBAL_CACHE_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/zig"
-
-            # Build and run the QEMU test executable
             ${pkgs.zig}/bin/zig build test-qemu -Doptimize=ReleaseSafe
             ./zig-out/bin/qemu-test
           '';
+
+          # Build all platforms (writes binaries to ./dist/)
+          build-all = pkgs.writeShellScriptBin "xenomorph-build-all" ''
+            set -e
+            rm -rf dist
+            mkdir -p dist
+            echo "Building x86_64..."
+            cp ${xenomorph-x86_64}/bin/xenomorph dist/xenomorph-x86_64-linux
+            echo "Building aarch64..."
+            cp ${xenomorph-aarch64}/bin/xenomorph dist/xenomorph-aarch64-linux
+            echo "Building armv7..."
+            cp ${xenomorph-armv7}/bin/xenomorph dist/xenomorph-armv7-linux
+            echo ""
+            echo "Binaries:"
+            ls -lh dist/
+          '';
+
+          # Build release artifacts + checksums (writes to ./release/)
+          release = pkgs.writeShellScriptBin "xenomorph-release" ''
+            set -e
+            rm -rf release
+            mkdir -p release
+
+            echo "Building static binaries..."
+            cp ${xenomorph-x86_64}/bin/xenomorph release/xenomorph-x86_64-linux
+            cp ${xenomorph-aarch64}/bin/xenomorph release/xenomorph-aarch64-linux
+            cp ${xenomorph-armv7}/bin/xenomorph release/xenomorph-armv7-linux
+
+            echo "Building release tarballs..."
+            cp ${releaseTarball-x86_64}/*.tar.gz release/
+            cp ${releaseTarball-aarch64}/*.tar.gz release/
+            cp ${releaseTarball-armv7}/*.tar.gz release/
+
+            cd release
+            sha256sum * > SHA256SUMS
+            echo ""
+            echo "Release artifacts:"
+            ls -lh
+            echo ""
+            cat SHA256SUMS
+          '';
         };
 
-        # Checks for Garnix CI
         checks = {
           build = xenomorph-x86_64;
           build-aarch64 = xenomorph-aarch64;
           build-armv7 = xenomorph-armv7;
 
-          # Run unit tests
           test = pkgs.stdenv.mkDerivation {
             pname = "xenomorph-test";
             inherit version;
             src = ./.;
 
             nativeBuildInputs = [ pkgs.zig ];
-
             dontConfigure = true;
             dontInstall = true;
 
             buildPhase = ''
               export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
-              zig build test
+              zig build test --system ${zigDepsDir}
               touch $out
             '';
           };
 
-          # Formatting check
           fmt = pkgs.stdenv.mkDerivation {
             pname = "xenomorph-fmt";
             inherit version;
             src = ./.;
 
             nativeBuildInputs = [ pkgs.zig ];
+            dontConfigure = true;
+            dontInstall = true;
 
             buildPhase = ''
               export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
               zig fmt --check src/ || echo "Format check skipped"
               touch $out
             '';
-
-            dontInstall = true;
           };
 
-          # QEMU integration test (requires KVM)
           qemu-integration = pkgs.stdenv.mkDerivation {
             pname = "xenomorph-qemu-integration";
             inherit version;
@@ -169,23 +219,16 @@
 
             dontConfigure = true;
             dontInstall = true;
-
-            # Require KVM for this test
             requiredSystemFeatures = [ "kvm" ];
 
             buildPhase = ''
               export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
-
-              # Set up environment for the test
               export KERNEL_PATH="${pkgs.linuxPackages_latest.kernel}/bzImage"
               export BUSYBOX_PATH="${pkgs.pkgsStatic.busybox}/bin/busybox"
               export QEMU_PATH="${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
               export XENOMORPH_PATH="${xenomorph-x86_64}/bin/xenomorph"
-
-              # Build and run the QEMU test
-              zig build test-qemu -Doptimize=ReleaseSafe
+              zig build test-qemu --system ${zigDepsDir} -Doptimize=ReleaseSafe
               ./zig-out/bin/qemu-test
-
               touch $out
             '';
           };
@@ -195,40 +238,30 @@
           buildInputs = with pkgs; [
             zig
             zls
-            # For QEMU integration tests
             qemu_kvm
             busybox
             cpio
             gzip
-            # Ensure proper less is available (busybox's less breaks git pager)
             less
           ];
 
           shellHook = ''
-            # Use real less instead of busybox's (fixes git pager)
             export PAGER="${pkgs.less}/bin/less"
-
             echo "Xenomorph development environment"
             echo "Zig version: $(zig version)"
             echo ""
-            echo "Build targets:"
-            echo "  nix build .#xenomorph-x86_64   # x86_64 static"
-            echo "  nix build .#xenomorph-aarch64  # aarch64 static"
-            echo "  nix build .#xenomorph-armv7    # armv7 static"
-            echo ""
-            echo "To run QEMU integration test:"
-            echo "  nix run .#qemu-test"
+            echo "Commands:"
+            echo "  nix run .#build-all   # Build binaries for all platforms → dist/"
+            echo "  nix run .#release     # Build release tarballs + checksums → release/"
+            echo "  nix run .#qemu-test   # Run QEMU integration test"
           '';
         };
       }
     ) // {
-      # Garnix-specific configuration
       garnix = {
         builds = {
-          # Only build for x86_64-linux (cross-compilation handles other targets)
           exclude = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" ];
         };
-        # Enable KVM for QEMU integration tests
         server.enable = true;
       };
     };

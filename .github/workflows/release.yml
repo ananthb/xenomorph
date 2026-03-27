@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -22,51 +22,15 @@ jobs:
         uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build release tarballs
-        run: |
-          # Build all architectures (Zig cross-compiles from x86_64)
-          nix build .#releaseTarball-x86_64 -L -o result-x86_64
-          nix build .#releaseTarball-aarch64 -L -o result-aarch64
-          nix build .#releaseTarball-armv7 -L -o result-armv7
-
-          # Copy tarballs
-          cp result-x86_64/*.tar.gz .
-          cp result-aarch64/*.tar.gz .
-          cp result-armv7/*.tar.gz .
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: xenomorph-release
-          path: "*.tar.gz"
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Prepare release assets
-        run: |
-          mkdir -p release
-          find artifacts -name "*.tar.gz" -exec cp {} release/ \;
-          ls -la release/
-
-      - name: Generate checksums
-        run: |
-          cd release
-          sha256sum *.tar.gz > SHA256SUMS
-          cat SHA256SUMS
+        run: nix run .#release
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
+            release/xenomorph-x86_64-linux
+            release/xenomorph-aarch64-linux
+            release/xenomorph-armv7-linux
             release/*.tar.gz
             release/SHA256SUMS
           generate_release_notes: true

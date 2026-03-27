@@ -20,11 +20,11 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1770197578,
-        "narHash": "sha256-AYqlWrX09+HvGs8zM6ebZ1pwUqjkfpnv8mewYwAo+iM=",
+        "lastModified": 1774386573,
+        "narHash": "sha256-4hAV26quOxdC6iyG7kYaZcM3VOskcPUrdCQd/nx8obc=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "00c21e4c93d963c50d4c0c89bfa84ed6e0694df2",
+        "rev": "46db2e09e1d3f113a13c0d7b81e2f221c63b8ce9",
         "type": "github"
       },
       "original": {
@@ -34,10 +34,45 @@
         "type": "github"
       }
     },
+    "oci-spec-zig": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1774629257,
+        "narHash": "sha256-c3JVVj6bg9R7HAhqGwmVKPz/AOHRoVp30m26cfeAxv8=",
+        "owner": "ananthb",
+        "repo": "oci-spec-zig",
+        "rev": "63ab8df05e640a9fb5d8cba1d779a71fb26a55c3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ananthb",
+        "ref": "zig-0.15-compat",
+        "repo": "oci-spec-zig",
+        "type": "github"
+      }
+    },
+    "oci-zig": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1774634598,
+        "narHash": "sha256-NLyMq2gWAQrzPAZBgMeuFa+wv8ov8bwhF6m9BvrXmTs=",
+        "owner": "ananthb",
+        "repo": "oci-zig",
+        "rev": "d1649ac73092bfb77aa945170609d1653c1d9631",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ananthb",
+        "repo": "oci-zig",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "oci-spec-zig": "oci-spec-zig",
+        "oci-zig": "oci-zig"
       }
     },
     "systems": {

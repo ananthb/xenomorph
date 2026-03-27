@@ -914,8 +914,11 @@ fn daemonize() void {
         std.process.exit(1);
     };
 
-    // Fork
-    const fork_result = linux.syscall0(.fork);
+    // Fork (aarch64 lacks fork syscall, use clone with SIGCHLD instead)
+    const fork_result = if (@hasField(linux.SYS, "fork"))
+        linux.syscall0(.fork)
+    else
+        linux.syscall5(.clone, linux.SIG.CHLD, 0, 0, 0, 0);
     if (linux.E.init(fork_result) != .SUCCESS) {
         std.debug.print("Error: fork failed\n", .{});
         std.process.exit(1);
