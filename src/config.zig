@@ -86,6 +86,36 @@ pub const Config = struct {
     /// Build context directory (default: directory containing containerfile)
     context: ?[]const u8 = null,
 
+    /// Keep existing firewall rules (default: flush all rules before services)
+    keep_firewall: bool = false,
+
+    /// Dropbear SSH port (null = SSH disabled)
+    ssh_port: ?u16 = null,
+
+    /// SSH root password (null = random, printed before pivot)
+    ssh_password: ?[]const u8 = null,
+
+    /// SSH authorized_keys file path (read at startup)
+    ssh_keyfile: ?[]const u8 = null,
+
+    /// WireGuard listen port (null = WireGuard disabled)
+    wg_port: ?u16 = null,
+
+    /// WireGuard private key
+    wg_privkey: ?[]const u8 = null,
+
+    /// WireGuard peer public key
+    wg_pubkey: ?[]const u8 = null,
+
+    /// WireGuard peer endpoint (host:port)
+    wg_endpoint: ?[]const u8 = null,
+
+    /// WireGuard allowed IPs (default: 0.0.0.0/0)
+    wg_allowed_ips: []const u8 = "0.0.0.0/0",
+
+    /// WireGuard interface address (default: 10.0.0.2/24)
+    wg_address: []const u8 = "10.0.0.2/24",
+
     /// Tailscale OCI image (added to layers when any --tailscale-* flag is used)
     tailscale_image: []const u8 = "docker.io/tailscale/tailscale:latest",
 
@@ -98,6 +128,11 @@ pub const Config = struct {
     /// Check if tailscale init script should be created
     pub fn tailscaleEnabled(self: *const Config) bool {
         return self.tailscale_authkey != null;
+    }
+
+    /// Check if any init services are configured
+    pub fn hasInitServices(self: *const Config) bool {
+        return self.ssh_port != null or self.wg_privkey != null or self.tailscaleEnabled() or !self.keep_firewall;
     }
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
@@ -207,6 +242,29 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
             cfg.containerfile = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--context")) {
             cfg.context = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--keep-firewall")) {
+            cfg.keep_firewall = true;
+        } else if (std.mem.eql(u8, arg, "--ssh-port")) {
+            cfg.ssh_port = try std.fmt.parseInt(u16, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, arg, "--ssh-password")) {
+            cfg.ssh_password = args.next() orelse return error.MissingValue;
+            if (cfg.ssh_port == null) cfg.ssh_port = 22;
+        } else if (std.mem.eql(u8, arg, "--ssh-keyfile")) {
+            cfg.ssh_keyfile = args.next() orelse return error.MissingValue;
+            if (cfg.ssh_port == null) cfg.ssh_port = 22;
+        } else if (std.mem.eql(u8, arg, "--wg-port")) {
+            cfg.wg_port = try std.fmt.parseInt(u16, args.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, arg, "--wg-privkey")) {
+            cfg.wg_privkey = args.next() orelse return error.MissingValue;
+            if (cfg.wg_port == null) cfg.wg_port = 51820;
+        } else if (std.mem.eql(u8, arg, "--wg-pubkey")) {
+            cfg.wg_pubkey = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--wg-endpoint")) {
+            cfg.wg_endpoint = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--wg-allowed-ips")) {
+            cfg.wg_allowed_ips = args.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--wg-address")) {
+            cfg.wg_address = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--tailscale-image")) {
             cfg.tailscale_image = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--tailscale-authkey")) {
@@ -519,9 +577,17 @@ pub fn validate(cfg: *const Config) !void {
         }
     }
 
-    if (cfg.headless and !cfg.tailscaleEnabled()) {
-        std.debug.print("Error: --headless requires an alternative login method (e.g. --tailscale-authkey)\n", .{});
-        return error.HeadlessRequiresLoginMethod;
+    if (cfg.wg_privkey != null and cfg.wg_pubkey == null) {
+        std.debug.print("Error: --wg-privkey requires --wg-pubkey\n", .{});
+        return error.WireguardMissingPubkey;
+    }
+    if (cfg.wg_pubkey != null and cfg.wg_privkey == null) {
+        std.debug.print("Error: --wg-pubkey requires --wg-privkey\n", .{});
+        return error.WireguardMissingPrivkey;
+    }
+
+    if (cfg.headless and !cfg.tailscaleEnabled() and cfg.ssh_port == null and cfg.wg_privkey == null) {
+        std.debug.print("Warning: --headless without remote access — ensure your entrypoint provides access\n", .{});
     }
 }
 

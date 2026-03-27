@@ -111,9 +111,9 @@ pub const RootfsBuilder = struct {
         scoped_log.info("Building rootfs from {s}", .{image_ref});
 
         // Estimate required size
-        const estimated_size = memory.estimateImageSize(image_ref) catch |err| {
+        const estimated_size: u64 = memory.estimateImageSize(image_ref) catch |err| blk: {
             scoped_log.warn("Cannot estimate image size: {}, using default 1GB", .{err});
-            return 1024 * 1024 * 1024;
+            break :blk 1024 * 1024 * 1024;
         };
 
         const tmpfs_size: u64 = @intFromFloat(@as(f64, @floatFromInt(estimated_size)) * options.tmpfs_headroom);

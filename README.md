@@ -110,6 +110,9 @@ sudo xenomorph pivot --headless --tailscale-authkey tskey-auth-xxxxx
 This forks into the background, pivots the root filesystem, and starts
 Tailscale in the new rootfs. Reconnect via `ssh root@<hostname>-xenomorph`.
 
+Use an [ephemeral auth key](https://tailscale.com/kb/1085/auth-keys) so
+the node is automatically removed from your tailnet when xenomorph is done.
+
 The `--headless` flag:
 - Forks and detaches from the terminal (`setsid`)
 - Logs to `/var/log/xenomorph.log` (configurable with `--log-dir`)

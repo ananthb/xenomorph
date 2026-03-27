@@ -40,7 +40,7 @@ pub const process_terminator = @import("process/terminator.zig");
 pub const process_essential = @import("process/essential.zig");
 pub const process_namespace = @import("process/namespace.zig");
 
-pub const tailscale = @import("tailscale.zig");
+pub const initscript = @import("initscript.zig");
 pub const config = @import("config.zig");
 
 const scoped_log = log.scoped("main");
@@ -352,30 +352,30 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
         }
     }
 
-    // Tailscale startup script (binaries already in rootfs from merge)
-    var ts_exec_cmd: []const u8 = resolved_cmd;
-    var ts_exec_args: ?[]const []const u8 = resolved_args;
+    // Create init script if any services are configured
+    var final_exec_cmd: []const u8 = resolved_cmd;
+    var final_exec_args: ?[]const []const u8 = resolved_args;
 
-    if (cfg.tailscaleEnabled()) {
-        scoped_log.info("Creating Tailscale startup script", .{});
-        var injector = tailscale.TailscaleInjector.init(allocator, cfg.tailscale_authkey.?, effective_ts_args);
-        defer injector.deinit();
-
-        injector.createStartupScript(cfg.work_dir) catch |err| {
-            scoped_log.err("Failed to create Tailscale startup script: {}", .{err});
+    const init_cfg = buildInitScriptConfig(allocator, cfg, effective_ts_args);
+    if (init_cfg.hasServices() or !init_cfg.flush_firewall) {
+        // flush_firewall defaults true, so "not flush" means --keep-firewall was set
+        // We always create the script if any service is configured OR if firewall should be flushed
+    }
+    if (init_cfg.hasServices() or init_cfg.flush_firewall) {
+        scoped_log.info("Creating init script", .{});
+        initscript.createInitScript(allocator, cfg.work_dir, &init_cfg) catch |err| {
+            scoped_log.err("Failed to create init script: {}", .{err});
             return err;
         };
 
-        // Wrap exec: run the init script which starts tailscale then exec's the real command
+        // Wrap exec through the init script
         var new_args: std.ArrayListUnmanaged([]const u8) = .{};
         try new_args.append(std.heap.page_allocator, resolved_cmd);
         if (resolved_args) |ra| {
             try new_args.appendSlice(std.heap.page_allocator, ra);
         }
-        ts_exec_args = try new_args.toOwnedSlice(std.heap.page_allocator);
-        ts_exec_cmd = "/usr/local/bin/xenomorph-ts-init";
-
-        scoped_log.info("Tailscale integration configured", .{});
+        final_exec_args = try new_args.toOwnedSlice(std.heap.page_allocator);
+        final_exec_cmd = initscript.init_script_path;
     }
 
     if (cfg.systemd_mode) {
@@ -469,8 +469,8 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
     try pivot.executePivot(.{
         .new_root = cfg.work_dir,
         .old_root_mount = cfg.keep_old_root[1..], // Remove leading /
-        .exec_cmd = ts_exec_cmd,
-        .exec_args = ts_exec_args,
+        .exec_cmd = final_exec_cmd,
+        .exec_args = final_exec_args,
         .keep_old_root = !cfg.no_keep_old_root,
         .exec_env = if (effective_config) |c| c.env else null,
         .allocator = allocator,
@@ -674,12 +674,16 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         }
     }
 
-    // Create tailscale startup script if enabled
-    if (cfg.tailscaleEnabled()) {
+    // Create init script if any services are configured
+    {
         const effective_ts_args = resolveTailscaleArgs(allocator, cfg);
-        var injector = tailscale.TailscaleInjector.init(allocator, cfg.tailscale_authkey.?, effective_ts_args);
-        defer injector.deinit();
-        try injector.createStartupScript(cfg.work_dir);
+        const init_cfg = buildInitScriptConfig(allocator, cfg, effective_ts_args);
+        if (init_cfg.hasServices() or init_cfg.flush_firewall) {
+            initscript.createInitScript(allocator, cfg.work_dir, &init_cfg) catch |err| {
+                scoped_log.err("Failed to create init script: {}", .{err});
+                return err;
+            };
+        }
     }
 
     // Save to cache
@@ -1025,6 +1029,61 @@ fn saveBuildCache(allocator: std.mem.Allocator, cache_dir: []const u8, key: []co
     };
 }
 
+fn readFileContent(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    // Try absolute then relative
+    const file = std.fs.openFileAbsolute(path, .{}) catch
+        std.fs.cwd().openFile(path, .{}) catch {
+        scoped_log.warn("Cannot open file: {s}", .{path});
+        return null;
+    };
+    defer file.close();
+    const stat = file.stat() catch return null;
+    const buf = allocator.alloc(u8, @intCast(stat.size)) catch return null;
+    const n = file.readAll(buf) catch {
+        allocator.free(buf);
+        return null;
+    };
+    return buf[0..n];
+}
+
+/// Build an InitScriptConfig from the CLI config
+fn buildInitScriptConfig(allocator: std.mem.Allocator, cfg: *const config.Config, effective_ts_args: []const u8) initscript.InitScriptConfig {
+    var init_cfg = initscript.InitScriptConfig{
+        .flush_firewall = !cfg.keep_firewall,
+    };
+
+    // SSH
+    if (cfg.ssh_port) |port| {
+        init_cfg.ssh = .{
+            .port = port,
+            .password = cfg.ssh_password,
+            .keyfile_content = if (cfg.ssh_keyfile) |path| readFileContent(allocator, path) else null,
+        };
+    }
+
+    // WireGuard
+    if (cfg.wg_privkey) |privkey| {
+        init_cfg.wireguard = .{
+            .port = cfg.wg_port orelse 51820,
+            .privkey = privkey,
+            .peer_pubkey = cfg.wg_pubkey orelse "",
+            .peer_endpoint = cfg.wg_endpoint,
+            .allowed_ips = cfg.wg_allowed_ips,
+            .address = cfg.wg_address,
+        };
+    }
+
+    // Tailscale
+    if (cfg.tailscale_authkey) |authkey| {
+        init_cfg.tailscale = .{
+            .authkey = authkey,
+            .args = effective_ts_args,
+        };
+    }
+
+    return init_cfg;
+}
+
 fn resolveTailscaleArgs(allocator: std.mem.Allocator, cfg: *const config.Config) []const u8 {
     if (!cfg.tailscaleEnabled()) return "--ssh";
     if (cfg.tailscale_args) |args| return args;
@@ -1135,6 +1194,6 @@ test "all modules compile" {
     _ = process_terminator;
     _ = process_essential;
     _ = process_namespace;
-    _ = tailscale;
+    _ = initscript;
     _ = config;
 }

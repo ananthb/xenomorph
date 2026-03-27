@@ -193,9 +193,9 @@
             '';
           };
 
-          # NixOS VM test: systemd rescue.target pivot
-          nixos-rescue = pkgs.nixosTest {
-            name = "xenomorph-rescue-target";
+          # NixOS VM test: local rootfs build + cache
+          nixos-local = pkgs.nixosTest {
+            name = "xenomorph-local-build";
 
             nodes.machine = { pkgs, lib, ... }: {
               imports = [ self.nixosModules.default ];
@@ -207,8 +207,7 @@
                 warmupBuildCache = true;
               };
 
-              # The test VM needs a rootfs to pivot into.
-              # Create a minimal rootfs with busybox as a local tarball.
+              # Create a minimal rootfs with busybox
               systemd.services.xenomorph-test-rootfs = {
                 description = "Create test rootfs for xenomorph";
                 wantedBy = [ "multi-user.target" ];
@@ -223,34 +222,63 @@
                   ln -sf busybox /var/lib/xenomorph-test/rootfs/bin/sh
                   ln -sf /bin/sh /var/lib/xenomorph-test/rootfs/sbin/init
                   echo "xenomorph-test" > /var/lib/xenomorph-test/rootfs/etc/hostname
-                  echo "XENOMORPH_TEST_ROOTFS=1" > /var/lib/xenomorph-test/rootfs/etc/environment
                 '';
               };
 
-              # Override xenomorph to use the local rootfs
               systemd.services.xenomorph-cache-warm.serviceConfig.ExecStart =
                 lib.mkForce "${xenomorph-x86_64}/bin/xenomorph build --rootfs /var/lib/xenomorph-test/rootfs";
 
-              systemd.services.xenomorph-pivot.serviceConfig.ExecStart =
-                lib.mkForce "${xenomorph-x86_64}/bin/xenomorph pivot --systemd-mode --force --rootfs /var/lib/xenomorph-test/rootfs --entrypoint /bin/sh --no-keep-old-root";
-
-              # Need enough memory for tmpfs rootfs
               virtualisation.memorySize = 2048;
             };
 
             testScript = ''
               machine.wait_for_unit("multi-user.target")
-
-              # Verify test rootfs was created
               machine.succeed("test -f /var/lib/xenomorph-test/rootfs/bin/sh")
-
-              # Verify cache warmup ran
               machine.wait_for_unit("xenomorph-cache-warm.service")
-              machine.succeed("ls /var/cache/xenomorph/builds/")
-
-              # Verify cache directory has content
               result = machine.succeed("find /var/cache/xenomorph/builds -name 'index.json' | head -1")
               assert result.strip() != "", "Build cache should contain an OCI layout"
+            '';
+          };
+
+          # NixOS VM test: pull from registry + build
+          nixos-registry-pull = pkgs.nixosTest {
+            name = "xenomorph-registry-pull";
+
+            nodes.machine = { pkgs, lib, ... }: {
+              virtualisation.memorySize = 4096;
+
+              # Need network access to pull from Docker Hub
+              networking.firewall.enable = false;
+
+              environment.systemPackages = [ xenomorph-x86_64 ];
+            };
+
+            testScript = ''
+              machine.wait_for_unit("network-online.target")
+
+              # Test: build from registry image (exercises estimateImageSize catch path)
+              machine.succeed(
+                "${xenomorph-x86_64}/bin/xenomorph build "
+                "--image docker.io/library/alpine:latest "
+                "--cache-dir /var/cache/xenomorph "
+                "-o /tmp/test-output.oci"
+              )
+
+              # Verify OCI layout was created
+              machine.succeed("test -f /tmp/test-output.oci/index.json")
+
+              # Verify cache was populated
+              result = machine.succeed("find /var/cache/xenomorph/builds -name 'index.json' | head -1")
+              assert result.strip() != "", "Build cache should contain an OCI layout"
+
+              # Test: second build should use cache (fast)
+              machine.succeed(
+                "${xenomorph-x86_64}/bin/xenomorph build "
+                "--image docker.io/library/alpine:latest "
+                "--cache-dir /var/cache/xenomorph "
+                "-o /tmp/test-output2.oci"
+              )
+              machine.succeed("test -f /tmp/test-output2.oci/index.json")
             '';
           };
 
