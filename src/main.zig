@@ -476,6 +476,15 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
     defer prep_result.deinit();
 
     scoped_log.info("Executing pivot_root", .{});
+    // Write log buffer to the new rootfs before pivot (survives the exec)
+    {
+        const log_path = std.fmt.allocPrint(allocator, "{s}{s}/xenomorph.log", .{ cfg.work_dir, cfg.log_dir }) catch null;
+        if (log_path) |lp| {
+            defer allocator.free(lp);
+            log.writeBufferToFile(lp);
+        }
+    }
+
     try pivot.executePivot(.{
         .new_root = cfg.work_dir,
         .old_root_mount = cfg.keep_old_root[1..], // Remove leading /
@@ -726,25 +735,10 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     // Optionally write rootfs tarball
     if (cfg.rootfs_output) |rootfs_path| {
         scoped_log.info("Writing rootfs tarball to {s}", .{rootfs_path});
-        const tar_cmd = std.fmt.allocPrint(
-            allocator,
-            "tar czf {s} --sort=name -C {s} .",
-            .{ rootfs_path, cfg.work_dir },
-        ) catch return error.OutOfMemory;
-        defer allocator.free(tar_cmd);
-
-        var child = std.process.Child.init(&.{ "sh", "-c", tar_cmd }, allocator);
-        child.spawn() catch return error.IoError;
-        const term = child.wait() catch return error.IoError;
-        switch (term) {
-            .Exited => |code| {
-                if (code != 0) {
-                    scoped_log.err("tar failed with exit code {}", .{code});
-                    return error.IoError;
-                }
-            },
-            else => return error.IoError,
-        }
+        oci_layout_writer.createTarFromDir(cfg.work_dir, rootfs_path, allocator) catch |err| {
+            scoped_log.err("Failed to create rootfs tarball: {}", .{err});
+            return err;
+        };
     }
 
     // Entrypoint validation (warning only for generate)
@@ -843,31 +837,36 @@ fn executeContainerfile(
                     const src_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ context_dir, src });
                     defer allocator.free(src_path);
 
-                    // Determine destination path within work_dir
                     const dest_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ work_dir, copy.dest });
                     defer allocator.free(dest_path);
 
-                    const cp_cmd = try std.fmt.allocPrint(
-                        allocator,
-                        "cp -a {s} {s}",
-                        .{ src_path, dest_path },
-                    );
-                    defer allocator.free(cp_cmd);
-
-                    var child = std.process.Child.init(&.{ "sh", "-c", cp_cmd }, allocator);
-                    child.spawn() catch {
-                        scoped_log.warn("Failed to copy {s} to {s}", .{ src, copy.dest });
-                        continue;
-                    };
-                    const term = child.wait() catch continue;
-                    switch (term) {
-                        .Exited => |code| {
-                            if (code != 0) {
-                                scoped_log.warn("cp failed for {s}", .{src});
-                            }
-                        },
-                        else => {},
+                    // Create destination directory
+                    if (std.fs.path.dirname(dest_path)) |parent| {
+                        var root_dir = std.fs.openDirAbsolute("/", .{}) catch continue;
+                        defer root_dir.close();
+                        if (parent.len > 1) root_dir.makePath(parent[1..]) catch {};
                     }
+
+                    rootfs_builder.copyDirRecursive(src_path, dest_path, allocator) catch |err| {
+                        // May be a file, not a dir — try file copy
+                        const src_file = std.fs.openFileAbsolute(src_path, .{}) catch {
+                            scoped_log.warn("Failed to copy {s}: {}", .{ src, err });
+                            continue;
+                        };
+                        defer src_file.close();
+                        const dir_path = std.fs.path.dirname(dest_path) orelse "/";
+                        var dst_dir = std.fs.openDirAbsolute(dir_path, .{}) catch continue;
+                        defer dst_dir.close();
+                        var dst_file = dst_dir.createFile(std.fs.path.basename(dest_path), .{}) catch continue;
+                        defer dst_file.close();
+                        var buf: [32768]u8 = undefined;
+                        while (true) {
+                            const n = src_file.readAll(&buf) catch break;
+                            if (n == 0) break;
+                            dst_file.writeAll(buf[0..n]) catch break;
+                            if (n < buf.len) break;
+                        }
+                    };
                 }
             },
             .env => |env| {

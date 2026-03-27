@@ -227,31 +227,10 @@ pub const RootfsBuilder = struct {
     ) BuildError!BuildResult {
         scoped_log.info("Copying directory {s} to tmpfs", .{src_path});
 
-        // Use cp -a with explicit glob to copy directory contents (busybox compatible)
-        // The -T flag or trailing /. doesn't work reliably with busybox cp
-        // Instead, we use a subshell to copy all files including hidden ones
-        const cp_cmd = std.fmt.allocPrint(
-            self.allocator,
-            "cd {s} && cp -a . {s}",
-            .{ src_path, options.target_dir },
-        ) catch return error.OutOfMemory;
-        defer self.allocator.free(cp_cmd);
-
-        scoped_log.debug("Copy command: {s}", .{cp_cmd});
-
-        var child = std.process.Child.init(&.{ "sh", "-c", cp_cmd }, self.allocator);
-        child.spawn() catch return error.IoError;
-        const term = child.wait() catch return error.IoError;
-
-        switch (term) {
-            .Exited => |code| {
-                if (code != 0) {
-                    scoped_log.err("Failed to copy directory: exit code {}", .{code});
-                    return error.IoError;
-                }
-            },
-            else => return error.IoError,
-        }
+        copyDirRecursive(src_path, options.target_dir, self.allocator) catch |err| {
+            scoped_log.err("Failed to copy directory: {}", .{err});
+            return error.IoError;
+        };
 
         // Verify copy worked by listing target
         scoped_log.debug("Verifying copy to {s}", .{options.target_dir});
@@ -486,22 +465,7 @@ pub const RootfsBuilder = struct {
             return try self.mergeOciLayout(path, target_dir);
         } else |_| {
             // Plain directory
-            const cp_cmd = std.fmt.allocPrint(
-                self.allocator,
-                "cd {s} && cp -a . {s}",
-                .{ path, target_dir },
-            ) catch return error.OutOfMemory;
-            defer self.allocator.free(cp_cmd);
-
-            var child = std.process.Child.init(&.{ "sh", "-c", cp_cmd }, self.allocator);
-            child.spawn() catch return error.IoError;
-            const term = child.wait() catch return error.IoError;
-            switch (term) {
-                .Exited => |code| {
-                    if (code != 0) return error.IoError;
-                },
-                else => return error.IoError,
-            }
+            copyDirRecursive(path, target_dir, self.allocator) catch return error.IoError;
             return null;
         }
     }
@@ -695,6 +659,53 @@ pub fn verifyRootfs(path: []const u8, allocator: std.mem.Allocator) !bool {
     }
 
     return has_executable;
+}
+
+/// Recursively copy directory contents from src to dst (like cp -a).
+pub fn copyDirRecursive(src_path: []const u8, dst_path: []const u8, allocator: std.mem.Allocator) !void {
+    var src_dir = try std.fs.openDirAbsolute(src_path, .{ .iterate = true });
+    defer src_dir.close();
+
+    var dst_dir = std.fs.openDirAbsolute(dst_path, .{}) catch {
+        std.fs.makeDirAbsolute(dst_path) catch {};
+        return copyDirRecursive(src_path, dst_path, allocator);
+    };
+    defer dst_dir.close();
+
+    var iter = src_dir.iterate();
+    while (try iter.next()) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                const child_src = try std.fs.path.join(allocator, &.{ src_path, entry.name });
+                defer allocator.free(child_src);
+                const child_dst = try std.fs.path.join(allocator, &.{ dst_path, entry.name });
+                defer allocator.free(child_dst);
+                dst_dir.makeDir(entry.name) catch {};
+                try copyDirRecursive(child_src, child_dst, allocator);
+            },
+            .file => {
+                const src_file = try src_dir.openFile(entry.name, .{});
+                defer src_file.close();
+                var dst_file = try dst_dir.createFile(entry.name, .{});
+                defer dst_file.close();
+                const stat = try src_file.stat();
+                var buf: [32768]u8 = undefined;
+                var total: u64 = 0;
+                while (total < stat.size) {
+                    const n = try src_file.readAll(&buf);
+                    if (n == 0) break;
+                    try dst_file.writeAll(buf[0..n]);
+                    total += n;
+                }
+            },
+            .sym_link => {
+                var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const target = try src_dir.readLink(entry.name, &link_buf);
+                dst_dir.symLink(target, entry.name, .{}) catch {};
+            },
+            else => {},
+        }
+    }
 }
 
 /// Get directory size recursively
