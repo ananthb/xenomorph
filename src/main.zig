@@ -249,11 +249,25 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
         }
     }
 
-    // Merge containerfile config if present
+    // Execute RUN commands from containerfile (after rootfs is built)
     if (cf_result) |cfr| {
+        for (cfr.run_commands) |argv| {
+            oci_lib.run.executeInRootfs(allocator, cfg.work_dir, argv, null) catch |err| {
+                scoped_log.err("RUN command failed: {}", .{err});
+                return err;
+            };
+        }
         if (cfr.img_config) |ic| {
             mergeImageConfig(allocator, &effective_config, ic);
         }
+    }
+
+    // Auto-install packages for --ssh-port
+    if (cfg.ssh_port != null) {
+        scoped_log.info("Installing dropbear SSH server", .{});
+        oci_lib.run.executeInRootfs(allocator, cfg.work_dir, &.{ "/bin/sh", "-c", "apk add --no-cache dropbear" }, null) catch |err| {
+            scoped_log.warn("Failed to install dropbear: {} (image may not be alpine-based)", .{err});
+        };
     }
 
     // Resolve effective entrypoint
@@ -357,10 +371,6 @@ fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effective_t
     var final_exec_args: ?[]const []const u8 = resolved_args;
 
     const init_cfg = buildInitScriptConfig(allocator, cfg, effective_ts_args);
-    if (init_cfg.hasServices() or !init_cfg.flush_firewall) {
-        // flush_firewall defaults true, so "not flush" means --keep-firewall was set
-        // We always create the script if any service is configured OR if firewall should be flushed
-    }
     if (init_cfg.hasServices() or init_cfg.flush_firewall) {
         scoped_log.info("Creating init script", .{});
         initscript.createInitScript(allocator, cfg.work_dir, &init_cfg) catch |err| {
@@ -667,18 +677,33 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         }
     }
 
-    // Merge containerfile config if present
+    // Execute RUN commands from containerfile
     if (cf_result_build) |cfr| {
+        for (cfr.run_commands) |argv| {
+            oci_lib.run.executeInRootfs(allocator, cfg.work_dir, argv, null) catch |err| {
+                scoped_log.err("RUN command failed: {}", .{err});
+                return err;
+            };
+        }
         if (cfr.img_config) |ic| {
             mergeImageConfig(allocator, &effective_config, ic);
         }
     }
 
+    // Auto-install packages for --ssh-port
+    if (cfg.ssh_port != null) {
+        scoped_log.info("Installing dropbear SSH server", .{});
+        oci_lib.run.executeInRootfs(allocator, cfg.work_dir, &.{ "/bin/sh", "-c", "apk add --no-cache dropbear" }, null) catch |err| {
+            scoped_log.warn("Failed to install dropbear: {} (image may not be alpine-based)", .{err});
+        };
+    }
+
     // Create init script if any services are configured
+    // Create init script only if services are configured (not for bare builds)
     {
         const effective_ts_args = resolveTailscaleArgs(allocator, cfg);
         const init_cfg = buildInitScriptConfig(allocator, cfg, effective_ts_args);
-        if (init_cfg.hasServices() or init_cfg.flush_firewall) {
+        if (init_cfg.hasServices()) {
             initscript.createInitScript(allocator, cfg.work_dir, &init_cfg) catch |err| {
                 scoped_log.err("Failed to create init script: {}", .{err});
                 return err;
@@ -752,9 +777,16 @@ fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
 const ContainerfileResult = struct {
     base_image: ?[]const u8,
     img_config: ?rootfs_builder.BuildResult.ImageConfig,
+    /// RUN commands to execute after the rootfs is built
+    run_commands: []const []const []const u8 = &.{},
 
     fn deinit(self: *ContainerfileResult, allocator: std.mem.Allocator) void {
         if (self.base_image) |bi| allocator.free(bi);
+        for (self.run_commands) |argv| {
+            for (argv) |a| allocator.free(a);
+            allocator.free(argv);
+        }
+        if (self.run_commands.len > 0) allocator.free(self.run_commands);
         if (self.img_config) |*ic| {
             if (ic.entrypoint) |ep| {
                 for (ep) |e| allocator.free(e);
@@ -790,6 +822,9 @@ fn executeContainerfile(
 
     var env_list: std.ArrayListUnmanaged([]const u8) = .{};
     defer env_list.deinit(allocator);
+
+    var run_commands: std.ArrayListUnmanaged([]const []const u8) = .{};
+    defer run_commands.deinit(allocator);
 
     var entrypoint: ?[]const []const u8 = null;
     var cmd: ?[]const []const u8 = null;
@@ -865,6 +900,10 @@ fn executeContainerfile(
                 }
                 cmd = new_cmd;
             },
+            .run => |r| {
+                // Collect RUN commands — they execute after the rootfs is built
+                try run_commands.append(allocator, r.argv);
+            },
             else => {}, // Other instructions stored but not acted on during build
         }
     }
@@ -881,6 +920,10 @@ fn executeContainerfile(
         .env = env_slice,
         .working_dir = working_dir,
     };
+
+    if (run_commands.items.len > 0) {
+        result.run_commands = try run_commands.toOwnedSlice(allocator);
+    }
 
     return result;
 }
@@ -1018,6 +1061,17 @@ fn saveBuildCache(allocator: std.mem.Allocator, cache_dir: []const u8, key: []co
 
     // Ensure cache directory structure exists
     {
+        std.fs.makeDirAbsolute(cache_dir) catch |err| {
+            if (err != error.PathAlreadyExists) {
+                // Try creating parent dirs
+                if (std.fs.path.dirname(cache_dir)) |parent| {
+                    var root = std.fs.openDirAbsolute("/", .{}) catch return;
+                    defer root.close();
+                    if (parent.len > 1) root.makePath(parent[1..]) catch return;
+                }
+                std.fs.makeDirAbsolute(cache_dir) catch return;
+            }
+        };
         var dir = std.fs.openDirAbsolute(cache_dir, .{}) catch return;
         defer dir.close();
         dir.makePath("builds") catch return;
@@ -1058,18 +1112,6 @@ fn buildInitScriptConfig(allocator: std.mem.Allocator, cfg: *const config.Config
             .port = port,
             .password = cfg.ssh_password,
             .keyfile_content = if (cfg.ssh_keyfile) |path| readFileContent(allocator, path) else null,
-        };
-    }
-
-    // WireGuard
-    if (cfg.wg_privkey) |privkey| {
-        init_cfg.wireguard = .{
-            .port = cfg.wg_port orelse 51820,
-            .privkey = privkey,
-            .peer_pubkey = cfg.wg_pubkey orelse "",
-            .peer_endpoint = cfg.wg_endpoint,
-            .allowed_ips = cfg.wg_allowed_ips,
-            .address = cfg.wg_address,
         };
     }
 

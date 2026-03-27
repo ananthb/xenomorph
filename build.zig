@@ -4,23 +4,61 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // OCI library dependency (../oci)
+    // OCI library dependency
     const oci_dep = b.dependency("oci", .{});
     const oci_module = oci_dep.module("oci");
 
-    // Main executable
-    const exe = b.addExecutable(.{
-        .name = "xenomorph",
+    // Compile xenomorph-init binary (embedded into xenomorph at build time)
+    const init_exe = b.addExecutable(.{
+        .name = "xenomorph-init",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/xenomorph-init.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    exe.root_module.addImport("oci", oci_module);
+
+    // Create a module that provides the init binary bytes via @embedFile.
+    // We write a small Zig file that imports the binary, and add the binary
+    // as a named resource so @embedFile can find it.
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(init_exe.getEmittedBin(), "xenomorph-init");
+    const embed_mod = b.createModule(.{
+        .root_source_file = wf.add("init_bin.zig",
+            \\pub const data = @embedFile("xenomorph-init");
+        ),
+    });
+
+    // Helper to create a xenomorph module with all dependencies
+    const makeXenomorphModule = struct {
+        fn f(
+            b_: *std.Build,
+            target_: std.Build.ResolvedTarget,
+            optimize_: std.builtin.OptimizeMode,
+            oci_mod: *std.Build.Module,
+            embed: *std.Build.Module,
+        ) *std.Build.Module {
+            const m = b_.createModule(.{
+                .root_source_file = b_.path("src/main.zig"),
+                .target = target_,
+                .optimize = optimize_,
+                .link_libc = true,
+            });
+            m.addImport("oci", oci_mod);
+            m.addImport("init_bin", embed);
+            return m;
+        }
+    }.f;
+
+    // Main executable
+    const exe = b.addExecutable(.{
+        .name = "xenomorph",
+        .root_module = makeXenomorphModule(b, target, optimize, oci_module, embed_mod),
+    });
 
     b.installArtifact(exe);
+    b.installArtifact(init_exe);
 
     // Run command
     const run_cmd = b.addRunArtifact(exe);
@@ -33,33 +71,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run xenomorph");
     run_step.dependOn(&run_cmd.step);
 
-    // Inline tests (from src/)
+    // Inline tests
     const inline_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
+        .root_module = makeXenomorphModule(b, target, optimize, oci_module, embed_mod),
     });
-    inline_tests.root_module.addImport("oci", oci_module);
 
-    // Unit test suite (from tests/unit/)
+    // Unit test suite
     const unit_module = b.createModule(.{
         .root_source_file = b.path("tests/unit/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    const unit_xenomorph_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    unit_xenomorph_module.addImport("oci", oci_module);
-    unit_module.addImport("xenomorph", unit_xenomorph_module);
+    unit_module.addImport("xenomorph", makeXenomorphModule(b, target, optimize, oci_module, embed_mod));
     unit_module.addImport("oci", oci_module);
+    unit_module.addImport("init_bin", embed_mod);
     const unit_tests = b.addTest(.{
         .root_module = unit_module,
     });
@@ -68,21 +94,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(inline_tests).step);
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
-    // Integration tests (separate step as they require root)
+    // Integration tests
     const integration_module = b.createModule(.{
         .root_source_file = b.path("tests/integration/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    const integration_xenomorph_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    integration_xenomorph_module.addImport("oci", oci_module);
-    integration_module.addImport("xenomorph", integration_xenomorph_module);
+    integration_module.addImport("xenomorph", makeXenomorphModule(b, target, optimize, oci_module, embed_mod));
     const integration_tests = b.addTest(.{
         .root_module = integration_module,
     });
@@ -90,7 +109,7 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-integration", "Run integration tests (requires root)");
     integration_test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
-    // QEMU integration test executable
+    // QEMU test
     const qemu_test_exe = b.addExecutable(.{
         .name = "qemu-test",
         .root_module = b.createModule(.{

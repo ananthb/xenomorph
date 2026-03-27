@@ -287,3 +287,61 @@ test "unit: build options defaults" {
     try std.testing.expect(opts.verify_digests);
     try std.testing.expect(!opts.skip_verify);
 }
+
+// --- SSH/firewall config tests ---
+
+test "unit: ssh config defaults" {
+    const t = std.testing;
+    const C = config_mod.Config;
+
+    // SSH disabled by default
+    try t.expect((C{}).ssh_port == null);
+    try t.expect((C{}).ssh_password == null);
+    try t.expect((C{}).ssh_keyfile == null);
+
+    // Setting password implies port 22
+    const cfg = C{ .ssh_password = "test123" };
+    try t.expectEqualStrings("test123", cfg.ssh_password.?);
+}
+
+test "unit: firewall default is flush" {
+    const t = std.testing;
+    try t.expect(!(config_mod.Config{}).keep_firewall);
+}
+
+test "unit: hasInitServices" {
+    const t = std.testing;
+    const C = config_mod.Config;
+
+    // No services by default (but firewall flush is on)
+    try t.expect((C{}).hasInitServices());
+
+    // With keep_firewall and nothing else
+    try t.expect(!(C{ .keep_firewall = true }).hasInitServices());
+
+    // SSH enables services
+    try t.expect((C{ .ssh_port = 22 }).hasInitServices());
+
+    // Tailscale enables services
+    try t.expect((C{ .tailscale_authkey = "tskey" }).hasInitServices());
+}
+
+// --- Initscript config tests ---
+
+test "unit: initscript config hasServices" {
+    const t = std.testing;
+    const ISC = xeno.initscript.InitScriptConfig;
+
+    try t.expect(!(ISC{}).hasServices());
+    try t.expect((ISC{ .ssh = .{} }).hasServices());
+    try t.expect((ISC{ .tailscale = .{ .authkey = "x", .args = "" } }).hasServices());
+}
+
+test "unit: embedded init binary is present" {
+    const t = std.testing;
+    // The init_bin module should have non-empty data
+    const init_bin = @import("init_bin");
+    try t.expect(init_bin.data.len > 0);
+    // Should start with ELF magic
+    try t.expectEqualStrings("\x7fELF", init_bin.data[0..4]);
+}

@@ -54,11 +54,11 @@
     "oci-zig": {
       "flake": false,
       "locked": {
-        "lastModified": 1774641739,
-        "narHash": "sha256-g710/cYq0JRnc/zdquXpK+rCTeKrfnyfMohHuDa2jfk=",
+        "lastModified": 1774648059,
+        "narHash": "sha256-tGMuXsFkpu+PAIQ+EeE/LxDHbP8kgoizTOpamNnNucU=",
         "owner": "ananthb",
         "repo": "oci-zig",
-        "rev": "72d21e252b143e80868738896e8156080583a1e4",
+        "rev": "4afb18fa00cc3a969082b775232affc112c2325c",
         "type": "github"
       },
       "original": {

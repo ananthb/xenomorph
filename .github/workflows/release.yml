@@ -28,9 +28,6 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            release/xenomorph-x86_64-linux
-            release/xenomorph-aarch64-linux
-            release/xenomorph-armv7-linux
             release/*.tar.gz
             release/SHA256SUMS
           generate_release_notes: true

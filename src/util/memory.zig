@@ -206,7 +206,17 @@ pub const TmpfsMount = struct {
 
     /// Mount the tmpfs
     fn mount(self: *Self, size_bytes: u64) !void {
-        // Create mount point directory
+        // Create mount point directory (including parents)
+        if (std.fs.path.dirname(self.path)) |parent| {
+            var parent_dir = std.fs.openDirAbsolute("/", .{}) catch {
+                scoped_log.err("Cannot open /", .{});
+                return error.MountFailed;
+            };
+            defer parent_dir.close();
+            // Strip leading / for makePath
+            const relative = if (parent.len > 1) parent[1..] else parent;
+            parent_dir.makePath(relative) catch {};
+        }
         std.fs.makeDirAbsolute(self.path) catch |err| {
             if (err != error.PathAlreadyExists) {
                 scoped_log.err("Cannot create tmpfs mount point {s}: {}", .{ self.path, err });

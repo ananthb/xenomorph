@@ -121,13 +121,13 @@ in
       description = "Xenomorph rootfs pivot";
       documentation = [ "https://github.com/ananthb/xenomorph" ];
 
-      # Run after rescue.target is reached (services are stopped)
       after = [ "rescue.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "rescue.target" ];
-
-      # Must have network for pulling images
       requires = [ "network-online.target" ];
+
+      # xenomorph needs tar/gzip for layer extraction
+      path = [ pkgs.gnutar pkgs.gzip ];
 
       serviceConfig = {
         Type = "oneshot";
@@ -155,8 +155,11 @@ in
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
+      path = [ pkgs.gnutar pkgs.gzip ];
+
       serviceConfig = {
         Type = "oneshot";
+        RemainAfterExit = true;
         ExecStart = "${cfg.package}/bin/xenomorph ${xenomorphBuildArgs}";
         CacheDirectory = "xenomorph";
         TimeoutStartSec = "infinity";
