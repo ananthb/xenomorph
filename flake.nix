@@ -260,15 +260,14 @@
 
             nodes.machine = { pkgs, lib, ... }: {
               virtualisation.memorySize = 4096;
-
-              # Need network access to pull from Docker Hub
               networking.firewall.enable = false;
-
+              systemd.services.NetworkManager-wait-online.enable = false;
               environment.systemPackages = [ xenomorph-x86_64 ];
             };
 
             testScript = ''
-              machine.wait_for_unit("network-online.target")
+              machine.wait_for_unit("multi-user.target")
+              machine.wait_until_succeeds("ping -c1 1.1.1.1", timeout=30)
 
               # Test: build from registry image (exercises estimateImageSize catch path)
               machine.succeed(
@@ -303,11 +302,13 @@
             nodes.machine = { pkgs, lib, ... }: {
               virtualisation.memorySize = 4096;
               networking.firewall.enable = false;
+              systemd.services.NetworkManager-wait-online.enable = false;
               environment.systemPackages = [ xenomorph-x86_64 ];
             };
 
             testScript = ''
-              machine.wait_for_unit("network-online.target")
+              machine.wait_for_unit("multi-user.target")
+              machine.wait_until_succeeds("ping -c1 1.1.1.1", timeout=30)
 
               # Test: build alpine + RUN apk add dropbear (via --ssh-port)
               machine.succeed(
