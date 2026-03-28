@@ -267,7 +267,7 @@
 
             testScript = ''
               machine.wait_for_unit("multi-user.target")
-              machine.wait_until_succeeds("ping -c1 1.1.1.1", timeout=30)
+              machine.wait_until_succeeds("getent hosts registry-1.docker.io", timeout=30)
 
               # Test: build from registry image (exercises estimateImageSize catch path)
               machine.succeed(
@@ -308,7 +308,7 @@
 
             testScript = ''
               machine.wait_for_unit("multi-user.target")
-              machine.wait_until_succeeds("ping -c1 1.1.1.1", timeout=30)
+              machine.wait_until_succeeds("getent hosts registry-1.docker.io", timeout=30)
 
               # Test: build alpine + RUN apk add dropbear (via --ssh-port)
               machine.succeed(
