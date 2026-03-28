@@ -8,6 +8,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/bin/xenomorph build
 CacheDirectory=xenomorph
+RuntimeDirectory=xenomorph
 TimeoutStartSec=infinity
 
 [Install]

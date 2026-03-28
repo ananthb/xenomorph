@@ -85,9 +85,11 @@ pub fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effecti
     const cached_path = checkBuildCache(allocator, cfg.cache_dir, &cache_key);
     defer if (cached_path) |p| allocator.free(p);
 
-    const use_cache = cached_path != null;
+    const use_cache = cached_path != null and !cfg.no_cache;
     if (use_cache) {
         scoped_log.info("Cache hit: {s}", .{cached_path.?});
+    } else if (cached_path != null and cfg.no_cache) {
+        scoped_log.info("Cache available but --no-cache specified, pulling fresh", .{});
     }
 
     // Build rootfs — from cache (single OCI layout) or from scratch (layer-by-layer)
@@ -170,7 +172,7 @@ pub fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effecti
     // Execute RUN commands from containerfile (after rootfs is built)
     if (cf_result) |cfr| {
         for (cfr.run_commands) |argv| {
-            oci_lib.run.executeInRootfs(allocator, cfg.work_dir, argv, null) catch |err| {
+            oci_lib.run.executeInRootfs(allocator, cfg.work_dir, argv, null, .{}) catch |err| {
                 scoped_log.err("RUN command failed: {}", .{err});
                 return err;
             };
@@ -183,7 +185,7 @@ pub fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effecti
     // Auto-install packages for --ssh-port
     if (cfg.ssh_port != null) {
         scoped_log.info("Installing dropbear SSH server", .{});
-        oci_lib.run.executeInRootfs(allocator, cfg.work_dir, &.{ "/bin/sh", "-c", "apk add --no-cache dropbear" }, null) catch |err| {
+        oci_lib.run.executeInRootfs(allocator, cfg.work_dir, &.{ "/bin/sh", "-c", "apk add --no-cache dropbear" }, null, .{}) catch |err| {
             scoped_log.warn("Failed to install dropbear: {} (image may not be alpine-based)", .{err});
         };
     }
@@ -306,6 +308,41 @@ pub fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effecti
         final_exec_cmd = initscript.init_script_path;
     }
 
+    // Container mode: run in mount+PID ns instead of real pivot
+    if (cfg.contain) {
+        scoped_log.info("Running in container mode", .{});
+
+        // Write log buffer before entering container
+        {
+            const log_path = std.fmt.allocPrint(allocator, "{s}{s}/xenomorph.log", .{ cfg.work_dir, cfg.log_dir }) catch null;
+            if (log_path) |lp| {
+                defer allocator.free(lp);
+                log.writeBufferToFile(lp);
+            }
+        }
+
+        // Build argv: xenomorph-init <entrypoint> [args...]
+        var container_argv: std.ArrayListUnmanaged([]const u8) = .{};
+        defer container_argv.deinit(allocator);
+        try container_argv.append(allocator, final_exec_cmd);
+        if (final_exec_args) |args| {
+            try container_argv.appendSlice(allocator, args);
+        }
+
+        const exit_code = oci_lib.run.runContainer(
+            allocator,
+            cfg.work_dir,
+            container_argv.items,
+            .{ .env = if (effective_config) |c| c.env else null },
+        ) catch |err| {
+            scoped_log.err("Container failed: {}", .{err});
+            return err;
+        };
+
+        scoped_log.info("Container exited with code {d}", .{exit_code});
+        return;
+    }
+
     if (cfg.systemd_mode) {
         scoped_log.info("Systemd mode: skipping init coordination and process termination", .{});
     } else {
@@ -389,7 +426,7 @@ pub fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effecti
     var prep_result = try pivot_prepare.prepare(.{
         .new_root = cfg.work_dir,
         .skip_verify = true, // Already verified
-        .create_namespace = !cfg.skip_namespace,
+        .create_namespace = false,
     }, allocator);
     defer prep_result.deinit();
 
@@ -405,10 +442,10 @@ pub fn runPivot(allocator: std.mem.Allocator, cfg: *const config.Config, effecti
 
     try pivot.executePivot(.{
         .new_root = cfg.work_dir,
-        .old_root_mount = cfg.keep_old_root[1..], // Remove leading /
+        .old_root_mount = "mnt/oldroot",
         .exec_cmd = final_exec_cmd,
         .exec_args = final_exec_args,
-        .keep_old_root = !cfg.no_keep_old_root,
+        .keep_old_root = cfg.keep_old_root,
         .exec_env = if (effective_config) |c| c.env else null,
         .allocator = allocator,
     });
@@ -442,7 +479,8 @@ pub fn dryRun(allocator: std.mem.Allocator, cfg: *const config.Config, effective
     }
 
     try stdout.print("\nEntrypoint: {s}\n", .{cfg.entrypoint});
-    try stdout.print("Old root mount: {s}\n", .{cfg.keep_old_root});
+    try stdout.print("Keep old root: {}\n", .{cfg.keep_old_root});
+    try stdout.print("Contain: {}\n", .{cfg.contain});
     try stdout.print("Timeout: {}s\n", .{cfg.timeout});
     if (cfg.headless) {
         try stdout.print("Mode: headless (will fork and detach, log to /var/log/xenomorph.log)\n", .{});

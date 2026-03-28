@@ -20,11 +20,13 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    // Read config
-    const config_file = std.fs.openFileAbsolute(config_path, .{}) catch |err| {
-        log("error: cannot open {s}: {}\n", .{ config_path, err });
-        // No config — just exec argv
-        execArgv();
+    // 0. Ensure essential device nodes exist
+    ensureDeviceNodes();
+
+    // Read config (optional — if missing, just supervise the entrypoint from argv)
+    const config_file = std.fs.openFileAbsolute(config_path, .{}) catch {
+        // No config — supervise argv directly
+        forkAndSupervise(allocator, null, true);
         return;
     };
     defer config_file.close();
@@ -34,9 +36,8 @@ pub fn main() !void {
     defer allocator.free(config_data);
     _ = try config_file.readAll(config_data);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_data, .{}) catch |err| {
-        log("error: cannot parse config: {}\n", .{err});
-        execArgv();
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_data, .{}) catch {
+        forkAndSupervise(allocator, null, true);
         return;
     };
     defer parsed.deinit();
@@ -58,8 +59,46 @@ pub fn main() !void {
         setupTailscale(allocator, ts);
     }
 
-    // 4. Exec entrypoint (from argv or config)
-    execArgv();
+    // 4. Fork entrypoint and act as init (reap zombies, forward signals)
+    const reboot_on_failure = getBool(root, "reboot_on_failure") orelse true;
+    forkAndSupervise(allocator, root, reboot_on_failure);
+}
+
+/// Ensure essential device nodes exist after pivot.
+/// The /dev bind mount should carry these over, but if not, create them.
+fn ensureDeviceNodes() void {
+    // Essential devices: (name, type, major, minor)
+    const Device = struct { name: []const u8, major: u32, minor: u32 };
+    const devices = [_]Device{
+        .{ .name = "/dev/null", .major = 1, .minor = 3 },
+        .{ .name = "/dev/zero", .major = 1, .minor = 5 },
+        .{ .name = "/dev/random", .major = 1, .minor = 8 },
+        .{ .name = "/dev/urandom", .major = 1, .minor = 9 },
+        .{ .name = "/dev/tty", .major = 5, .minor = 0 },
+    };
+
+    for (devices) |dev| {
+        std.fs.accessAbsolute(dev.name, .{}) catch {
+            // Device doesn't exist, create it with mknod
+            const path = std.posix.toPosixPath(dev.name) catch continue;
+            const dev_num = (@as(u64, dev.major) << 8) | @as(u64, dev.minor);
+            const rc = linux.syscall4(.mknodat, @bitCast(@as(isize, -100)), @intFromPtr(&path), linux.S.IFCHR | 0o666, dev_num);
+            if (linux.E.init(rc) != .SUCCESS) {
+                log("warning: cannot create {s}\n", .{dev.name});
+            }
+        };
+    }
+
+    // /dev/net/tun for VPN/WireGuard
+    std.fs.accessAbsolute("/dev/net/tun", .{}) catch {
+        std.fs.makeDirAbsolute("/dev/net") catch {};
+        const path = std.posix.toPosixPath("/dev/net/tun") catch return;
+        const tun_dev = (@as(u64, 10) << 8) | @as(u64, 200);
+        const rc = linux.syscall4(.mknodat, @bitCast(@as(isize, -100)), @intFromPtr(&path), linux.S.IFCHR | 0o666, tun_dev);
+        if (linux.E.init(rc) != .SUCCESS) {
+            log("warning: cannot create /dev/net/tun\n", .{});
+        }
+    };
 }
 
 fn flushFirewall(allocator: std.mem.Allocator) void {
@@ -196,29 +235,172 @@ fn setupTailscale(allocator: std.mem.Allocator, ts: std.json.Value) void {
 }
 
 /// Exec argv[1..] (the entrypoint passed after xenomorph-init)
-fn execArgv() void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    const allocator = arena.allocator();
+/// Signal flag set by the signal handler
+var got_signal: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
-    const args = std.process.argsAlloc(allocator) catch return;
-    if (args.len <= 1) {
+/// Fork the entrypoint, then act as init: forward signals and reap zombies.
+/// This is equivalent to tini — ensures no zombie processes accumulate and
+/// the entrypoint receives signals properly.
+fn forkAndSupervise(allocator: std.mem.Allocator, config_root: ?std.json.Value, reboot_on_failure: bool) void {
+    // Build argv from config entrypoint + command, or fall back to process args
+    var argv_buf: std.ArrayListUnmanaged(?[*:0]const u8) = .{};
+
+    var has_entrypoint = false;
+    if (config_root) |cr| {
+        if (cr.object.get("entrypoint")) |ep| {
+            if (ep == .array) {
+                for (ep.array.items) |item| {
+                    if (item == .string) {
+                        const z = allocator.dupeZ(u8, item.string) catch return;
+                        argv_buf.append(allocator, z) catch return;
+                        has_entrypoint = true;
+                    }
+                }
+            }
+        }
+        if (cr.object.get("command")) |cmd| {
+            if (cmd == .array) {
+                for (cmd.array.items) |item| {
+                    if (item == .string) {
+                        const z = allocator.dupeZ(u8, item.string) catch return;
+                        argv_buf.append(allocator, z) catch return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to process argv if no entrypoint in config
+    if (!has_entrypoint) {
+        const args = std.process.argsAlloc(allocator) catch return;
+        if (args.len <= 1) {
+            log("error: no entrypoint specified\n", .{});
+            std.process.exit(1);
+        }
+        for (args[1..]) |arg| {
+            const z = allocator.dupeZ(u8, arg) catch return;
+            argv_buf.append(allocator, z) catch return;
+        }
+    }
+
+    if (argv_buf.items.len == 0) {
         log("error: no entrypoint specified\n", .{});
         std.process.exit(1);
     }
 
-    // Build null-terminated argv
-    var argv: std.ArrayListUnmanaged(?[*:0]const u8) = .{};
-    for (args[1..]) |arg| {
-        const z = allocator.dupeZ(u8, arg) catch return;
-        argv.append(allocator, z) catch return;
-    }
-    argv.append(allocator, null) catch return;
+    argv_buf.append(allocator, null) catch return;
 
-    const cmd_z = allocator.dupeZ(u8, args[1]) catch return;
-    const envp = std.c.environ;
-    const err = std.posix.execveZ(cmd_z, @ptrCast(argv.items.ptr), @ptrCast(envp));
-    log("error: execve failed: {}\n", .{err});
+    // Install signal handler for forwarding
+    const SA_RESTART = 0x10000000;
+    var sa: linux.Sigaction = undefined;
+    @memset(std.mem.asBytes(&sa), 0);
+    sa.handler.handler = signalHandler;
+    sa.flags = SA_RESTART;
+    for ([_]u6{ linux.SIG.TERM, linux.SIG.INT, linux.SIG.HUP, linux.SIG.USR1, linux.SIG.USR2 }) |sig| {
+        _ = linux.sigaction(sig, &sa, null);
+    }
+
+    // Fork (aarch64 lacks fork syscall, use clone with SIGCHLD)
+    const pid = if (@hasField(linux.SYS, "fork"))
+        linux.syscall0(.fork)
+    else
+        linux.syscall5(.clone, linux.SIG.CHLD, 0, 0, 0, 0);
+    const fork_err = linux.E.init(pid);
+    if (fork_err != .SUCCESS) {
+        log("error: fork failed\n", .{});
+        std.process.exit(1);
+    }
+
+    if (pid == 0) {
+        // Child: exec entrypoint
+        const cmd_z = argv_buf.items[0].?;
+        const envp = std.c.environ;
+        const err = std.posix.execveZ(cmd_z, @ptrCast(argv_buf.items.ptr), @ptrCast(envp));
+        log("error: execve failed: {}\n", .{err});
+        std.process.exit(127);
+    }
+
+    // Parent: act as init
+    const child_pid: linux.pid_t = @bitCast(@as(u32, @truncate(pid)));
+    log("init: supervising pid {d}\n", .{child_pid});
+
+    while (true) {
+        // Forward any pending signal to the child
+        const sig = got_signal.swap(0, .seq_cst);
+        if (sig != 0) {
+            _ = linux.kill(child_pid, @bitCast(@as(u32, @truncate(sig))));
+        }
+
+        // Reap zombies (wait for any child, non-blocking)
+        var status: u32 = 0;
+        const waited_raw = linux.waitpid(-1, &status, linux.W.NOHANG);
+        const wait_err = linux.E.init(waited_raw);
+
+        if (wait_err == .CHILD) {
+            // No more children — entrypoint exited
+            break;
+        }
+
+        const waited: linux.pid_t = @bitCast(@as(u32, @truncate(waited_raw)));
+
+        if (waited == child_pid) {
+            // Our main child exited — reap remaining zombies then exit
+            const exit_code: u8 = if (linux.W.IFEXITED(status))
+                linux.W.EXITSTATUS(status)
+            else if (linux.W.IFSIGNALED(status))
+                @truncate(128 + linux.W.TERMSIG(status))
+            else
+                1;
+
+            // Reap any remaining orphans
+            while (true) {
+                const r = linux.waitpid(-1, &status, linux.W.NOHANG);
+                if (linux.E.init(r) == .CHILD) break;
+                if (r == 0) break;
+            }
+
+            log("init: entrypoint exited with code {d}\n", .{exit_code});
+            if (exit_code != 0 and reboot_on_failure) {
+                reboot();
+            }
+            std.process.exit(exit_code);
+        }
+
+        if (waited_raw == 0) {
+            // No child state change — sleep briefly
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+    }
+
+    log("init: all children exited unexpectedly\n", .{});
+    if (reboot_on_failure) {
+        reboot();
+    }
     std.process.exit(1);
+}
+
+/// Sync filesystems and reboot. Recovers the original OS since the
+/// tmpfs rootfs is lost on reboot.
+fn reboot() void {
+    log("init: rebooting in 5 seconds (entrypoint failed)...\n", .{});
+    std.Thread.sleep(5 * std.time.ns_per_s);
+
+    // Sync all filesystems to flush logs
+    _ = linux.syscall0(.sync);
+
+    // reboot(LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART)
+    const MAGIC1: usize = 0xfee1dead;
+    const MAGIC2: usize = 672274793; // LINUX_REBOOT_MAGIC2
+    const CMD_RESTART: usize = 0x01234567;
+    _ = linux.syscall4(.reboot, MAGIC1, MAGIC2, CMD_RESTART, 0);
+
+    // If reboot syscall fails, just exit
+    log("init: reboot syscall failed\n", .{});
+    std.process.exit(1);
+}
+
+fn signalHandler(sig: c_int) callconv(.c) void {
+    got_signal.store(@intCast(@as(u32, @bitCast(sig))), .seq_cst);
 }
 
 // --- Helpers ---

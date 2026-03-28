@@ -27,8 +27,12 @@ pub const Config = struct {
     /// Command/arguments passed to entrypoint
     command: []const []const u8 = &.{},
 
-    /// Mount point for old root
-    keep_old_root: []const u8 = "/mnt/oldroot",
+    /// Keep old root mounted at /mnt/oldroot (default: true)
+    keep_old_root: bool = true,
+
+    /// Run in a container (mount+PID ns, host network) instead of a real pivot.
+    /// The host is unaffected — useful for testing.
+    contain: bool = false,
 
     /// Skip confirmation prompts
     force: bool = false,
@@ -49,20 +53,17 @@ pub const Config = struct {
     /// Dry run mode
     dry_run: bool = false,
 
-    /// Don't keep old root accessible
-    no_keep_old_root: bool = false,
-
     /// Skip rootfs verification
     skip_verify: bool = false,
 
-    /// Skip mount namespace creation (for testing)
-    skip_namespace: bool = false,
+    /// Skip build cache (force fresh pull/build)
+    no_cache: bool = false,
 
     /// Cache directory for OCI layers
     cache_dir: []const u8 = "/var/cache/xenomorph",
 
-    /// Working directory for extraction
-    work_dir: []const u8 = "/var/lib/xenomorph/rootfs",
+    /// Working directory for rootfs extraction (ephemeral, under /run)
+    work_dir: []const u8 = "/run/xenomorph/rootfs",
 
     /// Log directory (used by headless mode)
     log_dir: []const u8 = "/var/log",
@@ -89,32 +90,31 @@ pub const Config = struct {
     /// Keep existing firewall rules (default: flush all rules before services)
     keep_firewall: bool = false,
 
-    /// Dropbear SSH port (null = SSH disabled)
+    /// SSH explicitly enabled/disabled (null = auto from other ssh.* flags)
+    ssh_enable: ?bool = null,
     ssh_port: ?u16 = null,
-
-    /// SSH root password (null = random, printed before pivot)
     ssh_password: ?[]const u8 = null,
+    ssh_authorized_keys: ?[]const u8 = null,
 
-    /// SSH authorized_keys file path (read at startup)
-    ssh_keyfile: ?[]const u8 = null,
-
-    /// Tailscale OCI image (added to layers when any --tailscale-* flag is used)
+    /// Tailscale explicitly enabled/disabled (null = auto from other tailscale.* flags)
+    tailscale_enable: ?bool = null,
     tailscale_image: []const u8 = "docker.io/tailscale/tailscale:latest",
-
-    /// Tailscale auth key (triggers tailscaled start + tailscale up in init script)
     tailscale_authkey: ?[]const u8 = null,
-
-    /// Arguments for 'tailscale up' (null = auto-generate with --ssh --hostname)
+    tailscale_server: ?[]const u8 = null,
     tailscale_args: ?[]const u8 = null,
 
-    /// Check if tailscale init script should be created
+    pub fn sshEnabled(self: *const Config) bool {
+        if (self.ssh_enable) |e| return e;
+        return self.ssh_port != null or self.ssh_password != null or self.ssh_authorized_keys != null;
+    }
+
     pub fn tailscaleEnabled(self: *const Config) bool {
+        if (self.tailscale_enable) |e| return e;
         return self.tailscale_authkey != null;
     }
 
-    /// Check if any init services are configured
     pub fn hasInitServices(self: *const Config) bool {
-        return self.ssh_port != null or self.tailscaleEnabled() or !self.keep_firewall;
+        return self.sshEnabled() or self.tailscaleEnabled() or !self.keep_firewall;
     }
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
@@ -161,16 +161,47 @@ pub fn parseArgs(allocator: std.mem.Allocator) !?Config {
     }
 }
 
+/// Parse a `--name=value` or `--name value` style argument.
+/// Returns the value if `arg` matches `prefix` (exact or with `=`), null otherwise.
+fn parseDotArg(arg: []const u8, args: *std.process.ArgIterator, prefix: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, arg, prefix)) {
+        return args.next();
+    }
+    if (arg.len > prefix.len and std.mem.startsWith(u8, arg, prefix) and arg[prefix.len] == '=') {
+        return arg[prefix.len + 1 ..];
+    }
+    return null;
+}
+
+/// Parse a `--name`, `--name=true`, or `--name=false` boolean flag.
+fn parseBoolArg(arg: []const u8, prefix: []const u8) ?bool {
+    if (std.mem.eql(u8, arg, prefix)) return true;
+    if (arg.len > prefix.len and std.mem.startsWith(u8, arg, prefix) and arg[prefix.len] == '=') {
+        const val = arg[prefix.len + 1 ..];
+        if (std.mem.eql(u8, val, "true")) return true;
+        if (std.mem.eql(u8, val, "false")) return false;
+    }
+    return null;
+}
+
 fn applyCacheDirEnv(cfg: *Config) void {
-    const env_val = std.posix.getenv("CACHE_DIRECTORY");
-    if (env_val) |dir| {
+    if (std.posix.getenv("CACHE_DIRECTORY")) |dir| {
         cfg.cache_dir = dir;
+    }
+}
+
+fn applyRuntimeDirEnv(cfg: *Config) void {
+    if (std.posix.getenv("RUNTIME_DIRECTORY")) |dir| {
+        // RUNTIME_DIRECTORY is set by systemd to e.g. /run/xenomorph
+        // Use a "rootfs" subdir under it
+        cfg.work_dir = std.fmt.allocPrint(std.heap.page_allocator, "{s}/rootfs", .{dir}) catch return;
     }
 }
 
 fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
     var cfg = Config{};
     applyCacheDirEnv(&cfg);
+    applyRuntimeDirEnv(&cfg);
 
     var layers_list: std.ArrayListUnmanaged(Layer) = .{};
     defer layers_list.deinit(std.heap.page_allocator);
@@ -189,7 +220,11 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
         } else if (std.mem.eql(u8, arg, "--command") or std.mem.eql(u8, arg, "--cmd")) {
             try command_list.append(std.heap.page_allocator, args.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, arg, "--keep-old-root")) {
-            cfg.keep_old_root = args.next() orelse return error.MissingValue;
+            cfg.keep_old_root = true;
+        } else if (std.mem.eql(u8, arg, "--no-keep-old-root")) {
+            cfg.keep_old_root = false;
+        } else if (std.mem.eql(u8, arg, "--contain") or std.mem.eql(u8, arg, "-c")) {
+            cfg.contain = true;
         } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
             cfg.force = true;
         } else if (std.mem.eql(u8, arg, "--timeout")) {
@@ -201,12 +236,10 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
             cfg.verbose = true;
         } else if (std.mem.eql(u8, arg, "--dry-run") or std.mem.eql(u8, arg, "-n")) {
             cfg.dry_run = true;
-        } else if (std.mem.eql(u8, arg, "--no-keep-old-root")) {
-            cfg.no_keep_old_root = true;
         } else if (std.mem.eql(u8, arg, "--skip-verify")) {
             cfg.skip_verify = true;
-        } else if (std.mem.eql(u8, arg, "--skip-namespace")) {
-            cfg.skip_namespace = true;
+        } else if (std.mem.eql(u8, arg, "--no-cache")) {
+            cfg.no_cache = true;
         } else if (std.mem.eql(u8, arg, "--cache-dir")) {
             cfg.cache_dir = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--work-dir")) {
@@ -226,24 +259,27 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
             cfg.context = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--keep-firewall")) {
             cfg.keep_firewall = true;
-        } else if (std.mem.eql(u8, arg, "--ssh-port")) {
-            cfg.ssh_port = try std.fmt.parseInt(u16, args.next() orelse return error.MissingValue, 10);
-        } else if (std.mem.eql(u8, arg, "--ssh-password")) {
-            cfg.ssh_password = args.next() orelse return error.MissingValue;
+        } else if (parseBoolArg(arg, "--ssh.enable")) |v| {
+            cfg.ssh_enable = v;
+            if (v and cfg.ssh_port == null) cfg.ssh_port = 22;
+        } else if (parseDotArg(arg, args, "--ssh.port")) |v| {
+            cfg.ssh_port = try std.fmt.parseInt(u16, v, 10);
+        } else if (parseDotArg(arg, args, "--ssh.password")) |v| {
+            cfg.ssh_password = v;
             if (cfg.ssh_port == null) cfg.ssh_port = 22;
-        } else if (std.mem.eql(u8, arg, "--ssh-keyfile")) {
-            cfg.ssh_keyfile = args.next() orelse return error.MissingValue;
+        } else if (parseDotArg(arg, args, "--ssh.authorized-keys")) |v| {
+            cfg.ssh_authorized_keys = v;
             if (cfg.ssh_port == null) cfg.ssh_port = 22;
-        } else if (std.mem.eql(u8, arg, "--tailscale-image")) {
-            cfg.tailscale_image = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--tailscale-authkey")) {
-            if (cfg.tailscale_authkey != null) {
-                std.debug.print("Error: --tailscale-authkey may only be specified once\n", .{});
-                return error.DuplicateOption;
-            }
-            cfg.tailscale_authkey = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--tailscale-args")) {
-            cfg.tailscale_args = args.next() orelse return error.MissingValue;
+        } else if (parseBoolArg(arg, "--tailscale.enable")) |v| {
+            cfg.tailscale_enable = v;
+        } else if (parseDotArg(arg, args, "--tailscale.image")) |v| {
+            cfg.tailscale_image = v;
+        } else if (parseDotArg(arg, args, "--tailscale.authkey")) |v| {
+            cfg.tailscale_authkey = v;
+        } else if (parseDotArg(arg, args, "--tailscale.server")) |v| {
+            cfg.tailscale_server = v;
+        } else if (parseDotArg(arg, args, "--tailscale.args")) |v| {
+            cfg.tailscale_args = v;
         } else if (std.mem.eql(u8, arg, "--")) {
             // Everything after -- is command args
             while (args.next()) |cmd_arg| {
@@ -255,10 +291,8 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
         }
     }
 
-    // Any tailscale flag adds the tailscale image as the last layer
-    if (cfg.tailscale_authkey != null or cfg.tailscale_args != null or
-        !std.mem.eql(u8, cfg.tailscale_image, "docker.io/tailscale/tailscale:latest"))
-    {
+    // Add tailscale image as last layer if enabled
+    if (cfg.tailscaleEnabled()) {
         try layers_list.append(std.heap.page_allocator, .{ .image = cfg.tailscale_image });
     }
 
@@ -276,6 +310,7 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
 fn parseBuildArgs(args: *std.process.ArgIterator) !Config {
     var cfg = Config{ .subcommand = .build };
     applyCacheDirEnv(&cfg);
+    applyRuntimeDirEnv(&cfg);
 
     var layers_list: std.ArrayListUnmanaged(Layer) = .{};
     defer layers_list.deinit(std.heap.page_allocator);
@@ -291,32 +326,32 @@ fn parseBuildArgs(args: *std.process.ArgIterator) !Config {
             cfg.rootfs_output = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             cfg.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--no-cache")) {
+            cfg.no_cache = true;
         } else if (std.mem.eql(u8, arg, "--work-dir")) {
             cfg.work_dir = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--containerfile") or std.mem.eql(u8, arg, "--dockerfile")) {
             cfg.containerfile = args.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--context")) {
             cfg.context = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--tailscale-image")) {
-            cfg.tailscale_image = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--tailscale-authkey")) {
-            if (cfg.tailscale_authkey != null) {
-                std.debug.print("Error: --tailscale-authkey may only be specified once\n", .{});
-                return error.DuplicateOption;
-            }
-            cfg.tailscale_authkey = args.next() orelse return error.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--tailscale-args")) {
-            cfg.tailscale_args = args.next() orelse return error.MissingValue;
+        } else if (parseBoolArg(arg, "--tailscale.enable")) |v| {
+            cfg.tailscale_enable = v;
+        } else if (parseDotArg(arg, args, "--tailscale.image")) |v| {
+            cfg.tailscale_image = v;
+        } else if (parseDotArg(arg, args, "--tailscale.authkey")) |v| {
+            cfg.tailscale_authkey = v;
+        } else if (parseDotArg(arg, args, "--tailscale.server")) |v| {
+            cfg.tailscale_server = v;
+        } else if (parseDotArg(arg, args, "--tailscale.args")) |v| {
+            cfg.tailscale_args = v;
         } else {
             std.debug.print("Unknown option: {s}\n", .{arg});
             return error.UnknownOption;
         }
     }
 
-    // Any tailscale flag adds the tailscale image as the last layer
-    if (cfg.tailscale_authkey != null or cfg.tailscale_args != null or
-        !std.mem.eql(u8, cfg.tailscale_image, "docker.io/tailscale/tailscale:latest"))
-    {
+    // Add tailscale image as last layer if enabled
+    if (cfg.tailscaleEnabled()) {
         try layers_list.append(std.heap.page_allocator, .{ .image = cfg.tailscale_image });
     }
 
@@ -432,12 +467,14 @@ fn printUsage() void {
         \\    --entrypoint <cmd>        Entrypoint for the new rootfs (default: from image or /bin/sh)
         \\    --command, --cmd <arg>    Command/args passed to entrypoint (repeatable)
         \\    -- <args>...              Arguments passed as command (alternative to --command)
-        \\    --keep-old-root <path>    Mount point for old root (default: /mnt/oldroot)
-        \\    --no-keep-old-root        Don't keep old root accessible
+        \\    --keep-old-root           Keep old root at /mnt/oldroot (default)
+        \\    --no-keep-old-root        Unmount old root after pivot
+        \\    -c, --contain             Run in a container (mount+PID ns) for testing
         \\    -f, --force               Skip confirmation prompts
         \\    --timeout <seconds>       Timeout for service shutdown (default: 30)
         \\    --no-init-coord           Skip init system coordination (dangerous)
         \\    --skip-verify             Skip rootfs verification
+        \\    --no-cache                Skip build cache, pull fresh
         \\    --cache-dir <path>        Cache directory for OCI layers
         \\    --work-dir <path>         Working directory for extraction
         \\    --log-dir <path>          Log directory for headless mode (default: /var/log)
@@ -449,10 +486,18 @@ fn printUsage() void {
         \\    --dockerfile <path>       Alias for --containerfile
         \\    --context <dir>           Build context directory (default: containerfile dir)
         \\
+        \\SSH:
+        \\    --ssh.enable[=bool]       Enable/disable SSH (auto if other ssh.* set)
+        \\    --ssh.port=<port>         SSH port (default: 22)
+        \\    --ssh.password=<pw>       Root password (default: random)
+        \\    --ssh.authorized-keys=<k> Authorized public keys (inline)
+        \\
         \\TAILSCALE:
-        \\    --tailscale-authkey <key> Starts tailscale inside the new rootfs
-        \\    --tailscale-image <ref>   Tailscale image (default: docker.io/tailscale/tailscale:latest)
-        \\    --tailscale-args <args>   Arguments for 'tailscale up'
+        \\    --tailscale.enable[=bool] Enable/disable tailscale (auto if authkey set)
+        \\    --tailscale.authkey=<key> Auth key (starts tailscale in new rootfs)
+        \\    --tailscale.server=<url>  Coordination server (for Headscale)
+        \\    --tailscale.image=<ref>   Image (default: docker.io/tailscale/tailscale:latest)
+        \\    --tailscale.args=<args>   Arguments for 'tailscale up'
         \\                              (default: --ssh --hostname=<hostname>-xenomorph)
         \\
         \\EXAMPLES:
@@ -466,7 +511,7 @@ fn printUsage() void {
         \\    xenomorph pivot --rootfs ./base.tar.gz --image myapp:latest
         \\
         \\    # Headless pivot over SSH with Tailscale
-        \\    xenomorph pivot --headless --tailscale-authkey tskey-auth-xxxxx
+        \\    xenomorph pivot --headless --tailscale.authkey=tskey-auth-xxxxx
         \\
         \\BUILD:
         \\    xenomorph build [--image <ref>...] [--rootfs <path>...] [-o <dir>]
@@ -517,7 +562,7 @@ fn parseConfigFile(allocator: std.mem.Allocator, content: []const u8) !Config {
             } else if (std.mem.eql(u8, key, "exec")) {
                 cfg.entrypoint = value;
             } else if (std.mem.eql(u8, key, "keep_old_root")) {
-                cfg.keep_old_root = value;
+                cfg.keep_old_root = std.mem.eql(u8, value, "true");
             } else if (std.mem.eql(u8, key, "timeout")) {
                 cfg.timeout = try std.fmt.parseInt(u32, value, 10);
             } else if (std.mem.eql(u8, key, "force")) {
@@ -539,10 +584,10 @@ pub fn validate(cfg: *const Config) !void {
 
     if (cfg.tailscale_authkey == null) {
         if (cfg.tailscale_args != null) {
-            std.debug.print("Warning: --tailscale-args without --tailscale-authkey won't start tailscale\n", .{});
+            std.debug.print("Warning: --tailscale.args without --tailscale.authkey won't start tailscale\n", .{});
         }
         if (!std.mem.eql(u8, cfg.tailscale_image, "docker.io/tailscale/tailscale:latest")) {
-            std.debug.print("Warning: --tailscale-image without --tailscale-authkey won't start tailscale\n", .{});
+            std.debug.print("Warning: --tailscale.image without --tailscale.authkey won't start tailscale\n", .{});
         }
     }
 
@@ -569,7 +614,7 @@ test "default config" {
     try testing.expectEqual(@as(usize, 1), cfg.layers.len);
     try testing.expectEqualStrings("docker.io/library/alpine:latest", cfg.layers[0].image);
     try testing.expectEqualStrings("/bin/sh", cfg.entrypoint);
-    try testing.expectEqualStrings("/mnt/oldroot", cfg.keep_old_root);
+    try testing.expect(cfg.keep_old_root);
     try testing.expectEqual(@as(u32, 30), cfg.timeout);
     try testing.expect(cfg.output == null);
     try testing.expect(!cfg.entrypoint_explicit);

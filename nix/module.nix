@@ -7,13 +7,18 @@ let
   layerArgs =
     (map (img: "--image ${img}") cfg.images)
     ++ (map (r: "--rootfs ${r}") cfg.rootfs)
-    ++ lib.optional (cfg.tailscale.enable && cfg.tailscale.image != null) "--tailscale-image ${cfg.tailscale.image}"
+    ++ lib.optional cfg.tailscale.enable "--tailscale.enable"
+    ++ lib.optional (cfg.tailscale.enable && cfg.tailscale.image != null) "--tailscale.image=${cfg.tailscale.image}"
     ++ lib.optional (cfg.tailscale.enable && cfg.tailscale.authKeyFile != null)
-      "--tailscale-authkey $(cat ${cfg.tailscale.authKeyFile})"
-    ++ lib.optional (cfg.tailscale.enable && cfg.tailscale.args != null) "--tailscale-args '${cfg.tailscale.args}'"
+      "--tailscale.authkey=$(cat ${cfg.tailscale.authKeyFile})"
+    ++ lib.optional (cfg.tailscale.enable && cfg.tailscale.server != null) "--tailscale.server=${cfg.tailscale.server}"
+    ++ lib.optional (cfg.tailscale.enable && cfg.tailscale.args != null) "--tailscale.args='${cfg.tailscale.args}'"
+    ++ lib.optional cfg.ssh.enable "--ssh.enable"
+    ++ lib.optional (cfg.ssh.enable && cfg.ssh.port != null) "--ssh.port=${toString cfg.ssh.port}"
+    ++ lib.optional (cfg.ssh.enable && cfg.ssh.password != null) "--ssh.password=${cfg.ssh.password}"
+    ++ lib.optional (cfg.ssh.enable && cfg.ssh.authorizedKeys != null) "--ssh.authorized-keys='${cfg.ssh.authorizedKeys}'"
     ++ lib.optional cfg.verbose "--verbose";
 
-  # Build the xenomorph pivot command line
   # Build command for cache pre-warming (no output, just cache)
   xenomorphBuildArgs = lib.concatStringsSep " " (
     [ "build" ] ++ layerArgs
@@ -86,13 +91,35 @@ in
       description = "Pull images and build rootfs on boot so pivot is instant.";
     };
 
+    ssh = {
+      enable = lib.mkEnableOption "Dropbear SSH in the new rootfs";
+
+      port = lib.mkOption {
+        type = lib.types.nullOr lib.types.port;
+        default = null;
+        description = "SSH port (default: 22).";
+      };
+
+      password = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "SSH root password. Null generates a random one.";
+      };
+
+      authorizedKeys = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "SSH authorized public keys (inline).";
+      };
+    };
+
     tailscale = {
       enable = lib.mkEnableOption "Tailscale integration";
 
       image = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
-        description = "Tailscale OCI image override (default: docker.io/tailscale/tailscale:latest).";
+        description = "Tailscale OCI image override.";
       };
 
       authKeyFile = lib.mkOption {
@@ -101,8 +128,13 @@ in
         description = ''
           Path to a file containing the Tailscale auth key.
           The file is read at runtime to avoid storing keys in the nix store.
-          Required for tailscale to actually start and authenticate.
         '';
+      };
+
+      server = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Tailscale coordination server URL (for Headscale).";
       };
 
       args = lib.mkOption {
@@ -114,9 +146,6 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # The xenomorph service runs as a oneshot triggered by rescue.target.
-    # systemd isolates to rescue.target first (stopping all services),
-    # then xenomorph pivots to the new rootfs.
     systemd.services.xenomorph-pivot = {
       description = "Xenomorph rootfs pivot";
       documentation = [ "https://github.com/ananthb/xenomorph" ];
@@ -126,17 +155,14 @@ in
       wantedBy = [ "rescue.target" ];
       requires = [ "network-online.target" ];
 
-      # xenomorph needs tar/gzip for layer extraction
-      path = [ pkgs.gnutar pkgs.gzip ];
-
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
 
         ExecStart = "${cfg.package}/bin/xenomorph ${xenomorphArgs}";
 
-        # systemd sets CACHE_DIRECTORY for us
         CacheDirectory = "xenomorph";
+        RuntimeDirectory = "xenomorph";
 
         TimeoutStartSec = "infinity";
         Restart = "no";
@@ -146,7 +172,6 @@ in
       };
     };
 
-    # Pre-warm the build cache during normal boot.
     systemd.services.xenomorph-cache-warm = lib.mkIf cfg.warmupBuildCache {
       description = "Xenomorph cache pre-warm";
       documentation = [ "https://github.com/ananthb/xenomorph" ];
@@ -155,13 +180,12 @@ in
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      path = [ pkgs.gnutar pkgs.gzip ];
-
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
         ExecStart = "${cfg.package}/bin/xenomorph ${xenomorphBuildArgs}";
         CacheDirectory = "xenomorph";
+        RuntimeDirectory = "xenomorph";
         TimeoutStartSec = "infinity";
         Restart = "no";
       };

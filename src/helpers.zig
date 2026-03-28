@@ -6,42 +6,25 @@ const initscript = @import("initscript.zig");
 const scoped_log = log.scoped("helpers");
 
 /// Read a file's content into an allocated buffer.
-pub fn readFileContent(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    // Try absolute then relative
-    const file = std.fs.openFileAbsolute(path, .{}) catch
-        std.fs.cwd().openFile(path, .{}) catch {
-        scoped_log.warn("Cannot open file: {s}", .{path});
-        return null;
-    };
-    defer file.close();
-    const stat = file.stat() catch return null;
-    const buf = allocator.alloc(u8, @intCast(stat.size)) catch return null;
-    const n = file.readAll(buf) catch {
-        allocator.free(buf);
-        return null;
-    };
-    return buf[0..n];
-}
-
 /// Build an InitScriptConfig from the CLI config.
-pub fn buildInitScriptConfig(allocator: std.mem.Allocator, cfg: *const config.Config, effective_ts_args: []const u8) initscript.InitScriptConfig {
+pub fn buildInitScriptConfig(_: std.mem.Allocator, cfg: *const config.Config, effective_ts_args: []const u8) initscript.InitScriptConfig {
     var init_cfg = initscript.InitScriptConfig{
         .flush_firewall = !cfg.keep_firewall,
     };
 
     // SSH
-    if (cfg.ssh_port) |port| {
+    if (cfg.sshEnabled()) {
         init_cfg.ssh = .{
-            .port = port,
+            .port = cfg.ssh_port orelse 22,
             .password = cfg.ssh_password,
-            .keyfile_content = if (cfg.ssh_keyfile) |path| readFileContent(allocator, path) else null,
+            .keyfile_content = cfg.ssh_authorized_keys,
         };
     }
 
     // Tailscale
-    if (cfg.tailscale_authkey) |authkey| {
+    if (cfg.tailscaleEnabled()) {
         init_cfg.tailscale = .{
-            .authkey = authkey,
+            .authkey = cfg.tailscale_authkey orelse "",
             .args = effective_ts_args,
         };
     }
@@ -50,7 +33,7 @@ pub fn buildInitScriptConfig(allocator: std.mem.Allocator, cfg: *const config.Co
 }
 
 /// Resolve the effective tailscale up arguments.
-/// If the user provided --tailscale-args, use that.
+/// If the user provided --tailscale.args, use that.
 /// Otherwise, generate a default: --ssh --hostname=<hostname>-xenomorph
 pub fn resolveTailscaleArgs(allocator: std.mem.Allocator, cfg: *const config.Config) []const u8 {
     if (!cfg.tailscaleEnabled()) return "--ssh";
@@ -61,9 +44,22 @@ pub fn resolveTailscaleArgs(allocator: std.mem.Allocator, cfg: *const config.Con
     _ = std.os.linux.syscall1(.uname, @intFromPtr(&uts));
     const hostname = std.mem.sliceTo(&uts.nodename, 0);
 
-    return std.fmt.allocPrint(
+    var base = std.fmt.allocPrint(
         allocator,
         "--ssh --hostname={s}-xenomorph",
         .{hostname},
-    ) catch "--ssh";
+    ) catch return "--ssh";
+
+    // Append --login-server if set
+    if (cfg.tailscale_server) |server| {
+        const with_server = std.fmt.allocPrint(
+            allocator,
+            "{s} --login-server={s}",
+            .{ base, server },
+        ) catch return base;
+        allocator.free(base);
+        base = with_server;
+    }
+
+    return base;
 }

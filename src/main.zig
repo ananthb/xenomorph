@@ -69,6 +69,7 @@ pub fn main() !void {
 
     if (cfg.verbose) {
         log.setLevel(.debug);
+        oci_lib.log.setLevel(.debug);
     }
 
     config.validate(&cfg) catch |err| {

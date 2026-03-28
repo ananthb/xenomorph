@@ -10,6 +10,7 @@ Type=oneshot
 RemainAfterExit=true
 ExecStart=/usr/local/bin/xenomorph pivot --systemd-mode --force
 CacheDirectory=xenomorph
+RuntimeDirectory=xenomorph
 TimeoutStartSec=infinity
 StandardOutput=journal+console
 StandardError=journal+console

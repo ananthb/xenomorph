@@ -108,7 +108,7 @@ pub fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     // Execute RUN commands from containerfile
     if (cf_result_build) |cfr| {
         for (cfr.run_commands) |argv| {
-            oci_lib.run.executeInRootfs(allocator, cfg.work_dir, argv, null) catch |err| {
+            oci_lib.run.executeInRootfs(allocator, cfg.work_dir, argv, null, .{}) catch |err| {
                 scoped_log.err("RUN command failed: {}", .{err});
                 return err;
             };
@@ -121,7 +121,7 @@ pub fn runBuild(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
     // Auto-install packages for --ssh-port
     if (cfg.ssh_port != null) {
         scoped_log.info("Installing dropbear SSH server", .{});
-        oci_lib.run.executeInRootfs(allocator, cfg.work_dir, &.{ "/bin/sh", "-c", "apk add --no-cache dropbear" }, null) catch |err| {
+        oci_lib.run.executeInRootfs(allocator, cfg.work_dir, &.{ "/bin/sh", "-c", "apk add --no-cache dropbear" }, null, .{}) catch |err| {
             scoped_log.warn("Failed to install dropbear: {} (image may not be alpine-based)", .{err});
         };
     }

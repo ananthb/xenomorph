@@ -116,7 +116,14 @@ pub const RootfsBuilder = struct {
             break :blk 1024 * 1024 * 1024;
         };
 
-        const tmpfs_size: u64 = @intFromFloat(@as(f64, @floatFromInt(estimated_size)) * options.tmpfs_headroom);
+        const size_float = @as(f64, @floatFromInt(estimated_size)) * options.tmpfs_headroom;
+        scoped_log.debug("Tmpfs size calculation: estimated={d}, headroom={d}, result={d}", .{
+            estimated_size, options.tmpfs_headroom, size_float,
+        });
+        const tmpfs_size: u64 = if (size_float < 0 or size_float > @as(f64, @floatFromInt(std.math.maxInt(u64))))
+            1024 * 1024 * 1024 // 1GB fallback
+        else
+            @intFromFloat(size_float);
 
         scoped_log.info("Estimated rootfs size: {d}MB, allocating {d}MB tmpfs", .{
             estimated_size / (1024 * 1024),
@@ -408,11 +415,17 @@ pub const RootfsBuilder = struct {
     ) BuildError!BuildResult {
         scoped_log.info("Pulling image from registry", .{});
 
-        // Create temp directory for downloads
-        const tmp_dir = "/tmp/xenomorph-pull";
-        std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-        std.fs.makeDirAbsolute(tmp_dir) catch return error.IoError;
+        // Create temp directory for downloads as a sibling of target_dir
+        const parent = std.fs.path.dirname(options.target_dir) orelse "/run";
+        const tmp_dir = std.fs.path.join(self.allocator, &.{ parent, "pull" }) catch return error.OutOfMemory;
+        defer self.allocator.free(tmp_dir);
         defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+        std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+        {
+            var root = std.fs.openDirAbsolute("/", .{}) catch return error.IoError;
+            defer root.close();
+            root.makePath(tmp_dir[1..]) catch return error.IoError;
+        }
 
         // Pull image
         oci_registry.pullImage(self.allocator, ref, tmp_dir) catch return error.DownloadFailed;
@@ -475,10 +488,16 @@ pub const RootfsBuilder = struct {
             return error.InvalidImage;
         defer ref.deinit(self.allocator);
 
-        const tmp_dir = "/tmp/xenomorph-merge";
-        std.fs.deleteTreeAbsolute(tmp_dir) catch {};
-        std.fs.makeDirAbsolute(tmp_dir) catch return error.IoError;
+        const parent = std.fs.path.dirname(target_dir) orelse "/run";
+        const tmp_dir = std.fs.path.join(self.allocator, &.{ parent, "merge" }) catch return error.OutOfMemory;
+        defer self.allocator.free(tmp_dir);
         defer std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+        std.fs.deleteTreeAbsolute(tmp_dir) catch {};
+        {
+            var root = std.fs.openDirAbsolute("/", .{}) catch return error.IoError;
+            defer root.close();
+            root.makePath(tmp_dir[1..]) catch return error.IoError;
+        }
 
         oci_registry.pullImage(self.allocator, &ref, tmp_dir) catch return error.DownloadFailed;
         return try self.mergeOciLayout(tmp_dir, target_dir);

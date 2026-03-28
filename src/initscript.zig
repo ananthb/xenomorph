@@ -17,6 +17,10 @@ pub const InitScriptConfig = struct {
     /// Flush iptables/nftables rules before starting services
     flush_firewall: bool = true,
 
+    /// Reboot the machine if the entrypoint exits with failure.
+    /// This recovers the original OS since the tmpfs rootfs is lost on reboot.
+    reboot_on_failure: bool = true,
+
     /// Dropbear SSH config (null = disabled)
     ssh: ?SshConfig = null,
 
@@ -105,6 +109,13 @@ fn buildConfigJson(allocator: std.mem.Allocator, cfg: *const InitScriptConfig) !
         allocator,
         "\"flush_firewall\":{s}",
         .{if (cfg.flush_firewall) "true" else "false"},
+    ));
+
+    // reboot_on_failure
+    try parts.append(allocator, try std.fmt.allocPrint(
+        allocator,
+        "\"reboot_on_failure\":{s}",
+        .{if (cfg.reboot_on_failure) "true" else "false"},
     ));
 
     // SSH

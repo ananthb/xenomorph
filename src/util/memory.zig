@@ -144,11 +144,12 @@ pub fn estimateImageSize(image_path: []const u8) !u64 {
         return stat.size;
     }
 
-    // Check if it's a local directory
-    var dir = std.fs.openDirAbsolute(image_path, .{ .iterate = true }) catch {
-        // For registry images, we'll need to check the manifest
-        // For now, return a conservative default
+    // Check if it's a local directory (only for absolute paths)
+    if (!std.mem.startsWith(u8, image_path, "/")) {
         return 1024 * 1024 * 1024; // 1GB default for registry images
+    }
+    var dir = std.fs.openDirAbsolute(image_path, .{ .iterate = true }) catch {
+        return 1024 * 1024 * 1024; // 1GB default
     };
     defer dir.close();
 

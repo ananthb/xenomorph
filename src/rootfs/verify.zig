@@ -92,19 +92,30 @@ pub fn verify(rootfs_path: []const u8, allocator: std.mem.Allocator) !VerifyResu
         };
     }
 
-    // Check for at least one executable
+    // Check for at least one executable (use fstatat with SYMLINK_NOFOLLOW
+    // to detect symlinks without resolving absolute targets through host root)
     var has_executable = false;
     for (essential_executables) |exe| {
         if (dir.access(exe, .{})) |_| {
             has_executable = true;
             scoped_log.debug("Found executable: {s}", .{exe});
             break;
-        } else |_| {}
+        } else |_| {
+            // access() follows symlinks, which fails for absolute symlink targets
+            // (resolved from host root, not rootfs). Check if the entry exists at all.
+            const path_z = std.posix.toPosixPath(exe) catch continue;
+            var stat_buf: std.os.linux.Stat = undefined;
+            const rc = std.os.linux.fstatat(dir.fd, &path_z, &stat_buf, std.os.linux.AT.SYMLINK_NOFOLLOW);
+            if (std.os.linux.E.init(rc) == .SUCCESS) {
+                has_executable = true;
+                scoped_log.debug("Found executable (symlink): {s}", .{exe});
+                break;
+            }
+        }
     }
 
     if (!has_executable) {
-        try result.errors.append(allocator, try allocator.dupe(u8, "No shell or init found (need bin/sh, bin/bash, or sbin/init)"));
-        result.valid = false;
+        try result.warnings.append(allocator, try allocator.dupe(u8, "No shell or init found (need bin/sh, bin/bash, or sbin/init) - image may use custom entrypoint"));
     }
 
     if (result.valid) {
@@ -127,11 +138,16 @@ pub fn isValid(rootfs_path: []const u8) bool {
         sub_dir.close();
     }
 
-    // Check for at least one executable
+    // Check for at least one executable (check symlinks without following)
     for (essential_executables) |exe| {
         if (dir.access(exe, .{})) |_| {
             return true;
-        } else |_| {}
+        } else |_| {
+            const path_z = std.posix.toPosixPath(exe) catch continue;
+            var stat_buf: std.os.linux.Stat = undefined;
+            const rc = std.os.linux.fstatat(dir.fd, &path_z, &stat_buf, std.os.linux.AT.SYMLINK_NOFOLLOW);
+            if (std.os.linux.E.init(rc) == .SUCCESS) return true;
+        }
     }
 
     return false;
