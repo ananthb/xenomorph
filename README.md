@@ -224,4 +224,4 @@ Use `xenomorph build` with no output flags to pre-warm the cache.
 
 ## License
 
-Licensed under the terms of the GPL-3.0. See [LICENSE](LICENSE).
+Licensed under the terms of the [AGPL-3.0](LICENSE).

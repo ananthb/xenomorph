@@ -66,7 +66,7 @@
           meta = with pkgs.lib; {
             description = "Linux pivot_root tool for OCI images";
             homepage = "https://github.com/ananthb/xenomorph";
-            license = licenses.gpl3Only;
+            license = licenses.agpl3Only;
             platforms = platforms.linux;
             mainProgram = "xenomorph";
           };
