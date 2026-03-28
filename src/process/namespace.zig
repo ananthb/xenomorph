@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = @import("../util/log.zig");
-const syscall = @import("../util/syscall.zig");
+const syscall = @import("oci").linux_util.syscall;
 
 const scoped_log = log.scoped("process/namespace");
 

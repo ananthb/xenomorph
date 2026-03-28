@@ -30,7 +30,7 @@
 
         # Read dependency hashes from build.zig.zon files so zig --system works.
         # These must match the .hash fields in build.zig.zon and oci-zig/build.zig.zon.
-        ociZigHash = "oci-0.1.0-1P7svsilAQALYfT9pKR4Z7f68uRgIV6stbQdGwLEg1lc";
+        ociZigHash = "oci-0.1.0-1P7svhpmAgCZYCiZMkLKljDLAOpkQ5x7VbWsmMUl6Exu";
         ociSpecHash = "ocispec-0.4.0-dev-voj0cXayAgC0zlyLL8rLlKZ6ecztwkiiApk4IzpAZoOp";
 
         # Create a directory structure that zig --system expects:

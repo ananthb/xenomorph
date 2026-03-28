@@ -2,8 +2,8 @@ const std = @import("std");
 
 // Utility modules
 pub const log = @import("util/log.zig");
-pub const syscall = @import("util/syscall.zig");
-pub const mount = @import("util/mount.zig");
+pub const syscall = oci_lib.linux_util.syscall;
+pub const mount = oci_lib.linux_util.mount_util;
 pub const memory = @import("util/memory.zig");
 
 // Pivot modules

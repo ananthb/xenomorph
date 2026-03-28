@@ -1,5 +1,5 @@
 const std = @import("std");
-const mount_util = @import("../util/mount.zig");
+const mount_util = @import("oci").linux_util.mount_util;
 const mounts = @import("mounts.zig");
 const log = @import("../util/log.zig");
 
