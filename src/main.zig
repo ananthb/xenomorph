@@ -48,7 +48,7 @@ const pivot_cmd = @import("cmd/pivot.zig");
 const build_cmd = @import("cmd/build.zig");
 const daemon_mod = @import("daemon.zig");
 const helpers = @import("helpers.zig");
-const cache = @import("cache.zig");
+pub const cache = @import("cache.zig");
 const containerfile_exec = @import("cmd/containerfile_exec.zig");
 
 const scoped_log = log.scoped("main");
