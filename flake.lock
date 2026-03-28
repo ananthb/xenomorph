@@ -37,16 +37,15 @@
     "oci-spec-zig": {
       "flake": false,
       "locked": {
-        "lastModified": 1774629257,
-        "narHash": "sha256-c3JVVj6bg9R7HAhqGwmVKPz/AOHRoVp30m26cfeAxv8=",
-        "owner": "ananthb",
+        "lastModified": 1774654121,
+        "narHash": "sha256-IN8xlMJuJTnH669v1Ip1VFlu7JflaEcdSQKbE6wgTwI=",
+        "owner": "navidys",
         "repo": "oci-spec-zig",
-        "rev": "63ab8df05e640a9fb5d8cba1d779a71fb26a55c3",
+        "rev": "9bb39600fb434e4ae34daed00fe7d9e48073b60a",
         "type": "github"
       },
       "original": {
-        "owner": "ananthb",
-        "ref": "zig-0.15-compat",
+        "owner": "navidys",
         "repo": "oci-spec-zig",
         "type": "github"
       }

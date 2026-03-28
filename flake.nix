@@ -9,7 +9,7 @@
       flake = false;
     };
     oci-spec-zig = {
-      url = "github:ananthb/oci-spec-zig/zig-0.15-compat";
+      url = "github:navidys/oci-spec-zig";
       flake = false;
     };
   };
@@ -31,7 +31,7 @@
         # Read dependency hashes from build.zig.zon files so zig --system works.
         # These must match the .hash fields in build.zig.zon and oci-zig/build.zig.zon.
         ociZigHash = "oci-0.1.0-1P7svhpmAgCZYCiZMkLKljDLAOpkQ5x7VbWsmMUl6Exu";
-        ociSpecHash = "ocispec-0.4.0-dev-voj0cXayAgC0zlyLL8rLlKZ6ecztwkiiApk4IzpAZoOp";
+        ociSpecHash = "ocispec-0.4.0-dev-voj0cey1AgDS-1Itn3Xu5AiWtB6cwMddZtDUssOtWrIn";
 
         # Create a directory structure that zig --system expects:
         # pkgdir/<hash> → source tree
