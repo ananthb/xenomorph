@@ -24,6 +24,17 @@ jobs:
       - name: Build release tarballs
         run: nix run .#release
 
+      - name: Add version to filenames
+        run: |
+          cd release
+          VERSION="${GITHUB_REF_NAME}"
+          for f in xenomorph-*.tar.gz; do
+            newname="${f/xenomorph-/xenomorph-${VERSION}-}"
+            mv "$f" "$newname"
+          done
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:

@@ -19,7 +19,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        version = if (self ? rev) then "0.2.0-${self.shortRev}" else "0.2.0-dev";
+        version = if (self ? shortRev) then self.shortRev else "dev";
 
         # Static build targets (Zig cross-compilation)
         targets = {
@@ -81,16 +81,16 @@
           nativeBuildInputs = [ pkgs.gnutar pkgs.gzip ];
 
           buildPhase = ''
-            mkdir -p xenomorph-${version}/bin
-            cp $src/bin/xenomorph xenomorph-${version}/bin/
-            cp -r ${./.}/init xenomorph-${version}/ 2>/dev/null || true
-            cp ${./.}/README.md xenomorph-${version}/ 2>/dev/null || echo "No README" > xenomorph-${version}/README.md
-            cp ${./.}/LICENSE xenomorph-${version}/ 2>/dev/null || true
+            mkdir -p xenomorph/bin
+            cp $src/bin/xenomorph xenomorph/bin/
+            cp -r ${./.}/init xenomorph/ 2>/dev/null || true
+            cp ${./.}/README.md xenomorph/ 2>/dev/null || echo "No README" > xenomorph/README.md
+            cp ${./.}/LICENSE xenomorph/ 2>/dev/null || true
           '';
 
           installPhase = ''
             mkdir -p $out
-            tar -czvf $out/xenomorph-${version}-${name}.tar.gz xenomorph-${version}
+            tar -czvf $out/xenomorph-${name}.tar.gz xenomorph
           '';
         };
 
