@@ -127,4 +127,31 @@ pub fn build(b: *std.Build) void {
 
     const qemu_test_step = b.step("test-qemu", "Run QEMU integration test (requires kernel, busybox, qemu)");
     qemu_test_step.dependOn(&run_qemu_test.step);
+
+    // Fuzz targets
+    const fuzz_module = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fuzz_module.addImport("xenomorph", makeXenomorphModule(b, target, optimize, oci_module, embed_mod));
+    fuzz_module.addImport("oci", oci_module);
+    const fuzz_tests = b.addTest(.{
+        .root_module = fuzz_module,
+    });
+
+    const fuzz_step = b.step("fuzz", "Run fuzz tests (use -ffuzz for continuous fuzzing)");
+    fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
+    // Valgrind step
+    const valgrind_step = b.step("valgrind", "Run tests under valgrind");
+    const valgrind_run = b.addSystemCommand(&.{
+        "valgrind",
+        "--leak-check=full",
+        "--error-exitcode=1",
+        "--track-origins=yes",
+    });
+    valgrind_run.addArtifactArg(inline_tests);
+    valgrind_step.dependOn(&valgrind_run.step);
 }

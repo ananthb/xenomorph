@@ -188,6 +188,23 @@
             '';
           };
 
+          # Fuzz corpus
+          fuzz = pkgs.stdenv.mkDerivation {
+            pname = "xenomorph-fuzz";
+            inherit version;
+            src = ./.;
+
+            nativeBuildInputs = [ pkgs.zig ];
+            dontConfigure = true;
+            dontInstall = true;
+
+            buildPhase = ''
+              export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
+              zig build fuzz --system ${zigDepsDir}
+              touch $out
+            '';
+          };
+
           # NixOS VM test: local rootfs build + cache
           nixos-local = pkgs.testers.nixosTest {
             name = "xenomorph-local-build";
@@ -327,6 +344,7 @@
           buildInputs = with pkgs; [
             zig
             zls
+            valgrind
             less
           ];
 
