@@ -1,6 +1,7 @@
 const std = @import("std");
-const syscall = @import("runz").linux_util.syscall;
-const mount_util = @import("runz").linux_util.mount_util;
+const runz = @import("runz");
+const syscall = runz.linux_util.syscall;
+const mount_util = runz.linux_util.mount_util;
 const mounts = @import("mounts.zig");
 const log = @import("../util/log.zig");
 
@@ -33,8 +34,8 @@ pub const PivotConfig = struct {
     /// Arguments for exec command
     exec_args: ?[]const []const u8 = null,
 
-    /// Keep old root accessible after pivot
-    keep_old_root: bool = true,
+    /// Path to keep old root (relative to /), or empty string to unmount.
+    keep_old_root: []const u8 = "mnt/oldroot",
 
     /// Environment variables for the exec'd command (null = inherit current env)
     exec_env: ?[]const []const u8 = null,
@@ -54,16 +55,7 @@ pub fn executePivot(config: PivotConfig) PivotError!void {
     };
     new_root_stat.close();
 
-    // Create the old root mount point inside new root
-    const old_root_path = std.fs.path.join(config.allocator, &.{ config.new_root, config.old_root_mount }) catch {
-        return error.AllocationFailed;
-    };
-    defer config.allocator.free(old_root_path);
-
-    scoped_log.debug("Old root will be at {s}", .{old_root_path});
-
     // Ensure old root mount point exists (including parent directories)
-    // Open the new root directory and create the path relative to it
     {
         var new_root_dir = std.fs.openDirAbsolute(config.new_root, .{}) catch |err| {
             scoped_log.err("Cannot open new root {s}: {}", .{ config.new_root, err });
@@ -78,20 +70,6 @@ pub fn executePivot(config: PivotConfig) PivotError!void {
         };
     }
 
-    scoped_log.debug("Created old root mount point", .{});
-
-    // Prepare null-terminated path for new_root
-    var new_root_buf: [std.fs.max_path_bytes]u8 = undefined;
-
-    if (config.new_root.len >= new_root_buf.len) {
-        return error.PathTooLong;
-    }
-
-    @memcpy(new_root_buf[0..config.new_root.len], config.new_root);
-    new_root_buf[config.new_root.len] = 0;
-
-    const new_root_z: [*:0]const u8 = @ptrCast(new_root_buf[0..config.new_root.len :0]);
-
     // Make mounts private to avoid propagation issues
     scoped_log.debug("Making root mount private", .{});
     mount_util.makePrivate("/") catch |err| {
@@ -103,73 +81,20 @@ pub fn executePivot(config: PivotConfig) PivotError!void {
         scoped_log.warn("Failed to make new root private: {}, continuing anyway", .{err});
     };
 
-    // Build absolute path for put_old (pivot_root requires put_old under new_root)
-    const put_old_abs_path = std.fs.path.join(config.allocator, &.{ config.new_root, config.old_root_mount }) catch {
-        return error.AllocationFailed;
-    };
-    defer config.allocator.free(put_old_abs_path);
-
-    var put_old_abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (put_old_abs_path.len >= put_old_abs_buf.len) {
-        return error.PathTooLong;
-    }
-    @memcpy(put_old_abs_buf[0..put_old_abs_path.len], put_old_abs_path);
-    put_old_abs_buf[put_old_abs_path.len] = 0;
-    const put_old_z: [*:0]const u8 = @ptrCast(put_old_abs_buf[0..put_old_abs_path.len :0]);
-
-    // First try pivot_root
-    scoped_log.info("Trying pivot_root({s}, {s})", .{ config.new_root, put_old_abs_path });
-    syscall.pivotRoot(new_root_z, put_old_z) catch |pivot_err| {
-        scoped_log.warn("pivot_root failed: {}, trying switch_root approach", .{pivot_err});
-
-        // Fallback to switch_root approach (for initramfs/rootfs)
-        // This is similar to what busybox's switch_root does
-        scoped_log.info("Using switch_root approach (chdir + mount move + chroot)", .{});
-
-        // 1. Change to new root
-        syscall.chdir(new_root_z) catch |err| {
-            scoped_log.err("chdir to new root failed: {}", .{err});
-            return error.ChdirFailed;
+    // Use runz pivotRoot helper
+    scoped_log.info("Performing pivot_root", .{});
+    mount_util.pivotRoot(config.new_root, config.old_root_mount) catch |err| {
+        scoped_log.err("pivotRoot failed: {}", .{err});
+        return switch (err) {
+            error.PivotRootFailed => error.PivotRootFailed,
+            error.ChdirFailed => error.ChdirFailed,
+            error.ChrootFailed => error.ChrootFailed,
+            error.PathTooLong => error.PathTooLong,
         };
-
-        // 2. Move mount to / (overmount)
-        scoped_log.debug("Moving mount to /", .{});
-        syscall.mount(".", "/", null, .{ .move = true }, null) catch |err| {
-            scoped_log.err("mount move failed: {}", .{err});
-            return error.PivotRootFailed;
-        };
-
-        // 3. Chroot to the new root
-        scoped_log.debug("Chroot to new root", .{});
-        syscall.chroot(".") catch |err| {
-            scoped_log.err("chroot failed: {}", .{err});
-            return error.ChrootFailed;
-        };
-
-        // 4. Change to / after chroot
-        syscall.chdir("/") catch |err| {
-            scoped_log.err("chdir to / after chroot failed: {}", .{err});
-            return error.ChdirFailed;
-        };
-
-        scoped_log.info("switch_root complete", .{});
-
-        // Execute post-pivot command if specified (same as pivot_root path)
-        if (config.exec_cmd) |cmd| {
-            try execCommand(cmd, config.exec_args, config.exec_env);
-        }
-        return;
-    };
-
-    // Change to new root
-    scoped_log.debug("Changing directory to /", .{});
-    syscall.chdir("/") catch |err| {
-        scoped_log.err("chdir to / failed: {}", .{err});
-        return error.ChdirFailed;
     };
 
     // Optionally cleanup old root
-    if (!config.keep_old_root) {
+    if (config.keep_old_root.len == 0) {
         scoped_log.info("Cleaning up old root", .{});
         const old_root_in_new = std.fs.path.join(config.allocator, &.{ "/", config.old_root_mount }) catch {
             return error.AllocationFailed;
@@ -301,6 +226,6 @@ test "PivotConfig defaults" {
     };
 
     try testing.expectEqualStrings("mnt/oldroot", config.old_root_mount);
-    try testing.expect(config.keep_old_root);
+    try testing.expectEqualStrings("mnt/oldroot", config.keep_old_root);
     try testing.expect(config.exec_cmd == null);
 }

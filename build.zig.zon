@@ -4,8 +4,8 @@
     .fingerprint = 0x2e962980f021c248,
     .dependencies = .{
         .runz = .{
-            .url = "git+https://github.com/ananthb/runz#c70c61346b40da792200684a406e951ef85fed23",
-            .hash = "runz-0.1.0-Fz_yRYguBACDt1f3XZqER1mnT3_Z7sApwWxGjaroD0Hg",
+            .url = "git+https://github.com/ananthb/runz#06e20dff2cb29ec427e915e6a285530cde35971e",
+            .hash = "runz-0.1.0-Fz_yRd5GBgCfsupWOqY1LRk7AXS49BlASN0f8pq8WwVF",
         },
     },
     .paths = .{

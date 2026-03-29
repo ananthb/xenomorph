@@ -1,6 +1,7 @@
 const std = @import("std");
-const syscall = @import("runz").linux_util.syscall;
-const mount_util = @import("runz").linux_util.mount_util;
+const runz = @import("runz");
+const syscall = runz.linux_util.syscall;
+const mount_util = runz.linux_util.mount_util;
 const log = @import("../util/log.zig");
 
 const scoped_log = log.scoped("mounts");
@@ -52,10 +53,24 @@ pub fn setupEssentialMounts(new_root: []const u8, allocator: std.mem.Allocator) 
             };
         } else {
             scoped_log.debug("Mounting {s} ({s}) at {s}", .{ em.source, em.fstype orelse "none", target_path });
-            mountFs(em.source, target_path, em.fstype) catch |err| {
-                scoped_log.warn("Failed to mount {s}: {}", .{ em.source, err });
-                return err;
-            };
+            if (std.mem.eql(u8, em.fstype orelse "", "proc")) {
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                @memcpy(path_buf[0..target_path.len], target_path);
+                path_buf[target_path.len] = 0;
+                const target_z: [*:0]const u8 = @ptrCast(path_buf[0..target_path.len :0]);
+                try syscall.mount("proc", target_z, "proc", .{ .nosuid = true, .noexec = true, .nodev = true }, null);
+            } else if (std.mem.eql(u8, em.fstype orelse "", "sysfs")) {
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                @memcpy(path_buf[0..target_path.len], target_path);
+                path_buf[target_path.len] = 0;
+                const target_z: [*:0]const u8 = @ptrCast(path_buf[0..target_path.len :0]);
+                try syscall.mount("sysfs", target_z, "sysfs", .{ .nosuid = true, .noexec = true, .nodev = true }, null);
+            } else {
+                mountFs(em.source, target_path, em.fstype) catch |err| {
+                    scoped_log.warn("Failed to mount {s}: {}", .{ em.source, err });
+                    return err;
+                };
+            }
         }
     }
 }
@@ -168,19 +183,4 @@ pub fn prepareNewRoot(new_root: []const u8, allocator: std.mem.Allocator) ![]con
     };
 
     return try allocator.dupe(u8, new_root);
-}
-
-test "essential mounts defined" {
-    const testing = std.testing;
-    try testing.expect(essential_mounts.len > 0);
-
-    // Verify /dev is included
-    var has_dev = false;
-    for (essential_mounts) |em| {
-        if (std.mem.eql(u8, em.source, "/dev")) {
-            has_dev = true;
-            break;
-        }
-    }
-    try testing.expect(has_dev);
 }

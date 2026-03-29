@@ -1,6 +1,7 @@
 const std = @import("std");
 const log = @import("log.zig");
-const syscall = @import("runz").linux_util.syscall;
+const runz = @import("runz");
+const system = runz.linux_util.system;
 
 const scoped_log = log.scoped("util/memory");
 
@@ -11,82 +12,12 @@ pub const MemoryError = error{
     UnmountFailed,
 };
 
-/// Memory information from /proc/meminfo
-pub const MemInfo = struct {
-    /// Total physical memory in bytes
-    total: u64,
-    /// Available memory in bytes (MemAvailable or Free + Buffers + Cached)
-    available: u64,
-    /// Free memory in bytes
-    free: u64,
-    /// Memory used by buffers
-    buffers: u64,
-    /// Memory used by cache
-    cached: u64,
-
-    /// Get percentage of memory available
-    pub fn availablePercent(self: MemInfo) f64 {
-        if (self.total == 0) return 0;
-        return @as(f64, @floatFromInt(self.available)) / @as(f64, @floatFromInt(self.total)) * 100.0;
-    }
-};
+/// Re-export MemInfo from runz
+pub const MemInfo = system.MemInfo;
 
 /// Read memory information from /proc/meminfo
 pub fn getMemInfo() MemoryError!MemInfo {
-    const file = std.fs.openFileAbsolute("/proc/meminfo", .{}) catch {
-        return error.CannotReadMemInfo;
-    };
-    defer file.close();
-
-    var buf: [4096]u8 = undefined;
-    const n = file.readAll(&buf) catch return error.CannotReadMemInfo;
-    const content = buf[0..n];
-
-    var info = MemInfo{
-        .total = 0,
-        .available = 0,
-        .free = 0,
-        .buffers = 0,
-        .cached = 0,
-    };
-
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "MemTotal:")) {
-            info.total = parseMemValue(line) orelse 0;
-        } else if (std.mem.startsWith(u8, line, "MemAvailable:")) {
-            info.available = parseMemValue(line) orelse 0;
-        } else if (std.mem.startsWith(u8, line, "MemFree:")) {
-            info.free = parseMemValue(line) orelse 0;
-        } else if (std.mem.startsWith(u8, line, "Buffers:")) {
-            info.buffers = parseMemValue(line) orelse 0;
-        } else if (std.mem.startsWith(u8, line, "Cached:")) {
-            info.cached = parseMemValue(line) orelse 0;
-        }
-    }
-
-    // If MemAvailable isn't present (older kernels), estimate it
-    if (info.available == 0) {
-        info.available = info.free + info.buffers + info.cached;
-    }
-
-    return info;
-}
-
-/// Parse a value from /proc/meminfo (e.g., "MemTotal:       16384000 kB")
-fn parseMemValue(line: []const u8) ?u64 {
-    // Find the colon
-    const colon_idx = std.mem.indexOf(u8, line, ":") orelse return null;
-    const value_part = std.mem.trim(u8, line[colon_idx + 1 ..], " \t");
-
-    // Split off the "kB" suffix
-    var parts = std.mem.splitScalar(u8, value_part, ' ');
-    const num_str = parts.next() orelse return null;
-
-    const value = std.fmt.parseInt(u64, num_str, 10) catch return null;
-
-    // Convert from kB to bytes
-    return value * 1024;
+    return system.MemInfo.get() catch error.CannotReadMemInfo;
 }
 
 /// Check if there's enough memory for a given size
@@ -122,25 +53,18 @@ pub fn checkAvailableMemory(required_bytes: u64) MemoryError!u64 {
 
 /// Estimate image size from OCI manifest or tarball
 pub fn estimateImageSize(image_path: []const u8) !u64 {
-    // For tarballs, use file size * 2 (compressed -> uncompressed estimate)
+    // For tarballs, use file size * 3 (compressed -> uncompressed estimate)
     if (std.mem.endsWith(u8, image_path, ".tar.gz") or
         std.mem.endsWith(u8, image_path, ".tgz"))
     {
-        const stat = std.fs.cwd().statFile(image_path) catch {
-            // Try absolute path
-            const file = std.fs.openFileAbsolute(image_path, .{}) catch return 512 * 1024 * 1024; // Default 512MB
-            defer file.close();
-            const s = file.stat() catch return 512 * 1024 * 1024;
-            return s.size * 3; // gzip typically 3x compression
-        };
+        const file = std.fs.openFileAbsolute(image_path, .{}) catch return 512 * 1024 * 1024;
+        defer file.close();
+        const stat = try file.stat();
         return stat.size * 3;
     } else if (std.mem.endsWith(u8, image_path, ".tar")) {
-        const stat = std.fs.cwd().statFile(image_path) catch {
-            const file = std.fs.openFileAbsolute(image_path, .{}) catch return 512 * 1024 * 1024;
-            defer file.close();
-            const s = file.stat() catch return 512 * 1024 * 1024;
-            return s.size;
-        };
+        const file = std.fs.openFileAbsolute(image_path, .{}) catch return 512 * 1024 * 1024;
+        defer file.close();
+        const stat = try file.stat();
         return stat.size;
     }
 
@@ -176,7 +100,7 @@ fn calculateDirSize(dir: std.fs.Dir) !u64 {
             .directory => {
                 var sub_dir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
                 defer sub_dir.close();
-                total += calculateDirSize(sub_dir) catch 0;
+                total += try calculateDirSize(sub_dir);
             },
             else => {},
         }
@@ -250,7 +174,7 @@ pub const TmpfsMount = struct {
             size_bytes / (1024 * 1024),
         });
 
-        syscall.mount("tmpfs", path_z, "tmpfs", .{}, opts_z) catch |err| {
+        runz.linux_util.syscall.mount("tmpfs", path_z, "tmpfs", .{}, opts_z) catch |err| {
             scoped_log.err("Failed to mount tmpfs: {}", .{err});
             return error.MountFailed;
         };
@@ -297,34 +221,5 @@ pub const TmpfsMount = struct {
 
 /// Format bytes as human-readable string
 pub fn formatBytes(bytes: u64, buf: []u8) []const u8 {
-    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
-    var size: f64 = @floatFromInt(bytes);
-    var unit_idx: usize = 0;
-
-    while (size >= 1024 and unit_idx < units.len - 1) {
-        size /= 1024;
-        unit_idx += 1;
-    }
-
-    return std.fmt.bufPrint(buf, "{d:.1}{s}", .{ size, units[unit_idx] }) catch "?";
-}
-
-test "parseMemValue" {
-    const testing = std.testing;
-
-    const val1 = parseMemValue("MemTotal:       16384000 kB");
-    try testing.expect(val1 != null);
-    try testing.expectEqual(@as(u64, 16384000 * 1024), val1.?);
-
-    const val2 = parseMemValue("Invalid line");
-    try testing.expect(val2 == null);
-}
-
-test "formatBytes" {
-    const testing = std.testing;
-    var buf: [32]u8 = undefined;
-
-    const result = formatBytes(1536 * 1024 * 1024, &buf);
-    try testing.expect(std.mem.indexOf(u8, result, "1.5") != null);
-    try testing.expect(std.mem.indexOf(u8, result, "GB") != null);
+    return system.formatBytes(bytes, buf);
 }

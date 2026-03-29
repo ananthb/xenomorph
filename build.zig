@@ -5,7 +5,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // runz container runtime library
-    const runz_dep = b.dependency("runz", .{});
+    const runz_dep = b.dependency("runz", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const runz_module = runz_dep.module("runz");
 
     // Compile xenomorph-init binary (embedded into xenomorph at build time)

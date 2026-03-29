@@ -1,6 +1,8 @@
 const std = @import("std");
 const log = @import("../util/log.zig");
 const scanner = @import("scanner.zig");
+const runz = @import("runz");
+const ProcessInfo = runz.linux_util.process.ProcessInfo;
 
 const scoped_log = log.scoped("process/essential");
 
@@ -61,7 +63,7 @@ const essential_by_name = [_]struct { name: []const u8, category: Category }{
 };
 
 /// Check if a process is essential and should not be killed
-pub fn isEssentialProcess(process: *const scanner.ProcessInfo) bool {
+pub fn isEssentialProcess(process: *const ProcessInfo) bool {
     // Always preserve PID 1
     if (process.pid == 1) return true;
 
@@ -91,7 +93,7 @@ pub fn isEssentialProcess(process: *const scanner.ProcessInfo) bool {
 }
 
 /// Get the category of an essential process
-pub fn getEssentialCategory(process: *const scanner.ProcessInfo) ?Category {
+pub fn getEssentialCategory(process: *const ProcessInfo) ?Category {
     if (process.pid == 1) return .init;
     if (process.isKernelThread()) return .kernel;
     if (process.pid == std.os.linux.getpid()) return .self;

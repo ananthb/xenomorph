@@ -27,8 +27,9 @@ pub const Config = struct {
     /// Command/arguments passed to entrypoint
     command: []const []const u8 = &.{},
 
-    /// Keep old root mounted at /mnt/oldroot (default: true)
-    keep_old_root: bool = true,
+    /// Keep old root mounted at given path (default: "/mnt/oldroot")
+    /// Set to empty string to unmount.
+    keep_old_root: []const u8 = "/mnt/oldroot",
 
     /// Run in a container (mount+PID ns, host network) instead of a real pivot.
     /// The host is unaffected — useful for testing.
@@ -220,9 +221,19 @@ fn parsePivotArgs(args: *std.process.ArgIterator) !Config {
         } else if (std.mem.eql(u8, arg, "--command") or std.mem.eql(u8, arg, "--cmd")) {
             try command_list.append(std.heap.page_allocator, args.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, arg, "--keep-old-root")) {
-            cfg.keep_old_root = true;
+            if (args.next()) |val| {
+                if (std.mem.startsWith(u8, val, "-")) {
+                    cfg.keep_old_root = "/mnt/oldroot";
+                    // Note: Ideally we'd put val back, but ArgIterator doesn't support it.
+                    // This is a known limitation of this simple parser.
+                } else {
+                    cfg.keep_old_root = val;
+                }
+            } else {
+                cfg.keep_old_root = "/mnt/oldroot";
+            }
         } else if (std.mem.eql(u8, arg, "--no-keep-old-root")) {
-            cfg.keep_old_root = false;
+            cfg.keep_old_root = "";
         } else if (std.mem.eql(u8, arg, "--contain") or std.mem.eql(u8, arg, "-c")) {
             cfg.contain = true;
         } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
@@ -488,9 +499,10 @@ fn printUsage() void {
         \\
         \\SSH:
         \\    --ssh.enable[=bool]       Enable/disable SSH (auto if other ssh.* set)
-        \\    --ssh.port=<port>         SSH port (default: 22)
+        \\    --ssh.port=<port>         SSH_PORT=<port> (default: 22)
         \\    --ssh.password=<pw>       Root password (default: random)
         \\    --ssh.authorized-keys=<k> Authorized public keys (inline)
+        \\    --ssh.keyfile=<path>      Path to authorized_keys file
         \\
         \\TAILSCALE:
         \\    --tailscale.enable[=bool] Enable/disable tailscale (auto if authkey set)
@@ -562,7 +574,13 @@ fn parseConfigFile(allocator: std.mem.Allocator, content: []const u8) !Config {
             } else if (std.mem.eql(u8, key, "exec")) {
                 cfg.entrypoint = value;
             } else if (std.mem.eql(u8, key, "keep_old_root")) {
-                cfg.keep_old_root = std.mem.eql(u8, value, "true");
+                if (std.mem.eql(u8, value, "true")) {
+                    cfg.keep_old_root = "/mnt/oldroot";
+                } else if (std.mem.eql(u8, value, "false")) {
+                    cfg.keep_old_root = "";
+                } else {
+                    cfg.keep_old_root = value;
+                }
             } else if (std.mem.eql(u8, key, "timeout")) {
                 cfg.timeout = try std.fmt.parseInt(u32, value, 10);
             } else if (std.mem.eql(u8, key, "force")) {
@@ -614,7 +632,7 @@ test "default config" {
     try testing.expectEqual(@as(usize, 1), cfg.layers.len);
     try testing.expectEqualStrings("docker.io/library/alpine:latest", cfg.layers[0].image);
     try testing.expectEqualStrings("/bin/sh", cfg.entrypoint);
-    try testing.expect(cfg.keep_old_root);
+    try testing.expectEqualStrings("/mnt/oldroot", cfg.keep_old_root);
     try testing.expectEqual(@as(u32, 30), cfg.timeout);
     try testing.expect(cfg.output == null);
     try testing.expect(!cfg.entrypoint_explicit);

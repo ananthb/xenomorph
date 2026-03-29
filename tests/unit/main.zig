@@ -144,7 +144,7 @@ test "unit: pivot config defaults" {
     const t = std.testing;
 
     try t.expectEqualStrings("mnt/oldroot", cfg.old_root_mount);
-    try t.expect(cfg.keep_old_root);
+    try t.expectEqualStrings("mnt/oldroot", cfg.keep_old_root);
     try t.expect(cfg.exec_cmd == null);
     try t.expect(cfg.exec_env == null);
 }
@@ -297,7 +297,7 @@ test "unit: ssh config defaults" {
     // SSH disabled by default
     try t.expect((C{}).ssh_port == null);
     try t.expect((C{}).ssh_password == null);
-    try t.expect((C{}).ssh_keyfile == null);
+    try t.expect((C{}).ssh_authorized_keys == null);
 
     // Setting password implies port 22
     const cfg = C{ .ssh_password = "test123" };
