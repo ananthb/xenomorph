@@ -4,8 +4,8 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    oci-zig = {
-      url = "github:ananthb/oci-zig";
+    runz = {
+      url = "github:ananthb/runz";
       flake = false;
     };
     oci-spec-zig = {
@@ -14,7 +14,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, oci-zig, oci-spec-zig }:
+  outputs = { self, nixpkgs, flake-utils, runz, oci-spec-zig }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -29,15 +29,15 @@
         };
 
         # Read dependency hashes from build.zig.zon files so zig --system works.
-        # These must match the .hash fields in build.zig.zon and oci-zig/build.zig.zon.
-        ociZigHash = "oci-0.1.0-1P7svhpmAgCZYCiZMkLKljDLAOpkQ5x7VbWsmMUl6Exu";
+        # These must match the .hash fields in build.zig.zon and runz/build.zig.zon.
+        runzHash = "runz-0.1.0-Fz_yRd5GBgCfsupWOqY1LRk7AXS49BlASN0f8pq8WwVF";
         ociSpecHash = "ocispec-0.4.0-dev-voj0cey1AgDS-1Itn3Xu5AiWtB6cwMddZtDUssOtWrIn";
 
         # Create a directory structure that zig --system expects:
         # pkgdir/<hash> → source tree
         zigDepsDir = pkgs.runCommand "xenomorph-zig-deps" {} ''
           mkdir -p $out
-          ln -s ${oci-zig} $out/${ociZigHash}
+          ln -s ${runz} $out/${runzHash}
           ln -s ${oci-spec-zig} $out/${ociSpecHash}
         '';
 

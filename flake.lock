@@ -50,28 +50,28 @@
         "type": "github"
       }
     },
-    "oci-zig": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1774689769,
-        "narHash": "sha256-7dOzwPiT9Hg+cIgVP4+MD2I3bOe60mzvNuitt54GJ2I=",
-        "owner": "ananthb",
-        "repo": "oci-zig",
-        "rev": "bcae06f6b561f9fcb126c0ff4354ee51afdc8661",
-        "type": "github"
-      },
-      "original": {
-        "owner": "ananthb",
-        "repo": "oci-zig",
-        "type": "github"
-      }
-    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
         "oci-spec-zig": "oci-spec-zig",
-        "oci-zig": "oci-zig"
+        "runz": "runz"
+      }
+    },
+    "runz": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1774816512,
+        "narHash": "sha256-/4ernutTsSsoCdPNEF/1E9JykCVnDIKeoSVuElGb0XI=",
+        "owner": "ananthb",
+        "repo": "runz",
+        "rev": "06e20dff2cb29ec427e915e6a285530cde35971e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ananthb",
+        "repo": "runz",
+        "type": "github"
       }
     },
     "systems": {
