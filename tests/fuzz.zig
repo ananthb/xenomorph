@@ -1,6 +1,6 @@
 const std = @import("std");
 const xeno = @import("xenomorph");
-const oci = @import("oci");
+const oci = @import("runz");
 
 // Fuzz targets for xenomorph-specific code.
 // Run with: zig build fuzz -ffuzz

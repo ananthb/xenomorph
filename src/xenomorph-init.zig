@@ -54,9 +54,9 @@ pub fn main() !void {
         setupSsh(allocator, ssh);
     }
 
-    // 3. Tailscale
+    // 3. Set tailscale env vars (let the image's entrypoint handle tailscale)
     if (root.object.get("tailscale")) |ts| {
-        setupTailscale(allocator, ts);
+        setTailscaleEnv(ts);
     }
 
     // 4. Fork entrypoint and act as init (reap zombies, forward signals)
@@ -176,62 +176,35 @@ fn setupSsh(allocator: std.mem.Allocator, ssh: std.json.Value) void {
     log("dropbear SSH listening on port {s}\n", .{port});
 }
 
-fn setupTailscale(allocator: std.mem.Allocator, ts: std.json.Value) void {
-    const authkey = getString(ts, "authkey") orelse return;
-    const args_str = getString(ts, "args") orelse "--ssh";
+/// Set environment variables for the image's native tailscale entrypoint
+/// (e.g. containerboot reads TS_AUTHKEY, TS_EXTRA_ARGS, etc.)
+/// Set environment variables for the image's native tailscale entrypoint
+/// (e.g. containerboot reads TS_AUTHKEY, TS_EXTRA_ARGS, etc.)
+fn setTailscaleEnv(ts: std.json.Value) void {
+    if (getString(ts, "authkey")) |authkey| {
+        setEnv("TS_AUTHKEY", authkey);
+        log("set TS_AUTHKEY\n", .{});
+    }
+    if (getString(ts, "args")) |args_str| {
+        setEnv("TS_EXTRA_ARGS", args_str);
+        log("set TS_EXTRA_ARGS={s}\n", .{args_str});
+    }
+    _ = @"setenv"("TS_STATE_DIR", "/var/lib/tailscale", 1);
+    _ = @"setenv"("TS_SOCKET", "/var/run/tailscale/tailscaled.sock", 1);
 
     std.fs.makeDirAbsolute("/var/lib/tailscale") catch {};
     std.fs.makeDirAbsolute("/var/run/tailscale") catch {};
+}
 
-    // Start tailscaled in background
-    spawnBackground(allocator, &.{
-        "/usr/local/bin/tailscaled",
-        "--state=/var/lib/tailscale/tailscaled.state",
-        "--socket=/var/run/tailscale/tailscaled.sock",
-    });
+extern "c" fn @"setenv"(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
-    // Wait for socket
-    var i: u32 = 0;
-    while (i < 50) : (i += 1) {
-        std.fs.accessAbsolute("/var/run/tailscale/tailscaled.sock", .{}) catch {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
-            continue;
-        };
-        break;
-    }
-
-    std.fs.accessAbsolute("/var/run/tailscale/tailscaled.sock", .{}) catch {
-        log("warning: tailscaled failed to start\n", .{});
-        return;
-    };
-
-    // Build tailscale up command
-    const auth_arg = std.fmt.allocPrint(allocator, "--authkey={s}", .{authkey}) catch return;
-    defer allocator.free(auth_arg);
-
-    // Parse args_str into individual args
-    var up_argv_buf: [20][]const u8 = undefined;
-    var up_argc: usize = 0;
-    up_argv_buf[up_argc] = "/usr/local/bin/tailscale";
-    up_argc += 1;
-    up_argv_buf[up_argc] = "--socket=/var/run/tailscale/tailscaled.sock";
-    up_argc += 1;
-    up_argv_buf[up_argc] = "up";
-    up_argc += 1;
-    up_argv_buf[up_argc] = auth_arg;
-    up_argc += 1;
-
-    // Split args_str on spaces
-    var args_iter = std.mem.tokenizeScalar(u8, args_str, ' ');
-    while (args_iter.next()) |arg| {
-        if (up_argc < up_argv_buf.len) {
-            up_argv_buf[up_argc] = arg;
-            up_argc += 1;
-        }
-    }
-
-    runWait(allocator, up_argv_buf[0..up_argc]);
-    log("tailscale connected\n", .{});
+fn setEnv(key: [*:0]const u8, value: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    if (value.len >= buf.len) return;
+    @memcpy(buf[0..value.len], value);
+    buf[value.len] = 0;
+    const val_z: [*:0]const u8 = @ptrCast(buf[0..value.len :0]);
+    _ = @"setenv"(key, val_z, 1);
 }
 
 /// Exec argv[1..] (the entrypoint passed after xenomorph-init)

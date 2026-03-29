@@ -3,9 +3,9 @@
     .version = "0.1.0",
     .fingerprint = 0x2e962980f021c248,
     .dependencies = .{
-        .oci = .{
-            .url = "git+https://github.com/ananthb/oci-zig#cee3ef3d41ffdca559f5c4f8a824db30f9f34acc",
-            .hash = "oci-0.1.0-1P7svlMtAwDKsb6LyW0FSVhOF91k_BvQWEHAsFEx8qBl",
+        .runz = .{
+            .url = "git+https://github.com/ananthb/runz#c70c61346b40da792200684a406e951ef85fed23",
+            .hash = "runz-0.1.0-Fz_yRYguBACDt1f3XZqER1mnT3_Z7sApwWxGjaroD0Hg",
         },
     },
     .paths = .{

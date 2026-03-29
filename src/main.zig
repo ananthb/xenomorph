@@ -2,7 +2,7 @@ const std = @import("std");
 
 // Utility modules
 pub const log = @import("util/log.zig");
-const oci_lib = @import("oci");
+const oci_lib = @import("runz");
 pub const syscall = oci_lib.linux_util.syscall;
 pub const mount = oci_lib.linux_util.mount_util;
 pub const memory = @import("util/memory.zig");

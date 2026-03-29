@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = @import("../util/log.zig");
-const syscall = @import("oci").linux_util.syscall;
+const syscall = @import("runz").linux_util.syscall;
 const scanner = @import("scanner.zig");
 const essential = @import("essential.zig");
 

@@ -1,6 +1,6 @@
 const std = @import("std");
 const log = @import("../util/log.zig");
-const oci_lib = @import("oci");
+const oci_lib = @import("runz");
 const rootfs_builder = @import("../rootfs/builder.zig");
 const oci_containerfile = oci_lib.containerfile;
 

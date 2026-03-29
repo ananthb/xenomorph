@@ -4,9 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // OCI library dependency
-    const oci_dep = b.dependency("oci", .{});
-    const oci_module = oci_dep.module("oci");
+    // runz container runtime library
+    const runz_dep = b.dependency("runz", .{});
+    const runz_module = runz_dep.module("runz");
 
     // Compile xenomorph-init binary (embedded into xenomorph at build time)
     const init_exe = b.addExecutable(.{
@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
             b_: *std.Build,
             target_: std.Build.ResolvedTarget,
             optimize_: std.builtin.OptimizeMode,
-            oci_mod: *std.Build.Module,
+            runz_mod: *std.Build.Module,
             embed: *std.Build.Module,
         ) *std.Build.Module {
             const m = b_.createModule(.{
@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize_,
                 .link_libc = true,
             });
-            m.addImport("oci", oci_mod);
+            m.addImport("runz", runz_mod);
             m.addImport("init_bin", embed);
             return m;
         }
@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     // Main executable
     const exe = b.addExecutable(.{
         .name = "xenomorph",
-        .root_module = makeXenomorphModule(b, target, optimize, oci_module, embed_mod),
+        .root_module = makeXenomorphModule(b, target, optimize, runz_module, embed_mod),
     });
 
     b.installArtifact(exe);
@@ -73,7 +73,7 @@ pub fn build(b: *std.Build) void {
 
     // Inline tests
     const inline_tests = b.addTest(.{
-        .root_module = makeXenomorphModule(b, target, optimize, oci_module, embed_mod),
+        .root_module = makeXenomorphModule(b, target, optimize, runz_module, embed_mod),
     });
 
     // Unit test suite
@@ -83,8 +83,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    unit_module.addImport("xenomorph", makeXenomorphModule(b, target, optimize, oci_module, embed_mod));
-    unit_module.addImport("oci", oci_module);
+    unit_module.addImport("xenomorph", makeXenomorphModule(b, target, optimize, runz_module, embed_mod));
+    unit_module.addImport("runz", runz_module);
     unit_module.addImport("init_bin", embed_mod);
     const unit_tests = b.addTest(.{
         .root_module = unit_module,
@@ -101,7 +101,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    integration_module.addImport("xenomorph", makeXenomorphModule(b, target, optimize, oci_module, embed_mod));
+    integration_module.addImport("xenomorph", makeXenomorphModule(b, target, optimize, runz_module, embed_mod));
     const integration_tests = b.addTest(.{
         .root_module = integration_module,
     });
@@ -135,8 +135,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    fuzz_module.addImport("xenomorph", makeXenomorphModule(b, target, optimize, oci_module, embed_mod));
-    fuzz_module.addImport("oci", oci_module);
+    fuzz_module.addImport("xenomorph", makeXenomorphModule(b, target, optimize, runz_module, embed_mod));
+    fuzz_module.addImport("runz", runz_module);
     const fuzz_tests = b.addTest(.{
         .root_module = fuzz_module,
     });

@@ -1,6 +1,6 @@
 const std = @import("std");
-const syscall = @import("oci").linux_util.syscall;
-const mount_util = @import("oci").linux_util.mount_util;
+const syscall = @import("runz").linux_util.syscall;
+const mount_util = @import("runz").linux_util.mount_util;
 const mounts = @import("mounts.zig");
 const log = @import("../util/log.zig");
 

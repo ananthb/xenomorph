@@ -1,7 +1,7 @@
 const std = @import("std");
 const mounts = @import("mounts.zig");
 const pivot = @import("pivot.zig");
-const mount_util = @import("oci").linux_util.mount_util;
+const mount_util = @import("runz").linux_util.mount_util;
 const log = @import("../util/log.zig");
 
 const scoped_log = log.scoped("prepare");

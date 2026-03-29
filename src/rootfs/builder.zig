@@ -1,10 +1,10 @@
 const std = @import("std");
 const log = @import("../util/log.zig");
 const memory = @import("../util/memory.zig");
-const oci_image = @import("oci").image;
-const oci_layer = @import("oci").layer;
-const oci_registry = @import("oci").registry;
-const oci_cache = @import("oci").cache;
+const oci_image = @import("runz").image;
+const oci_layer = @import("runz").layer;
+const oci_registry = @import("runz").registry;
+const oci_cache = @import("runz").cache;
 const config_mod = @import("../config.zig");
 
 pub const Layer = config_mod.Layer;
@@ -59,7 +59,7 @@ pub const BuildResult = struct {
     /// Tmpfs mount - caller must keep this alive until after pivot
     tmpfs_mount: memory.TmpfsMount,
 
-    pub const ImageConfig = @import("oci").layout_writer.ImageConfig;
+    pub const ImageConfig = @import("runz").layout_writer.ImageConfig;
 
     pub fn deinit(self: *BuildResult, allocator: std.mem.Allocator) void {
         allocator.free(self.rootfs_path);
