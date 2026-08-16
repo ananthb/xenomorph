@@ -51,11 +51,10 @@ func runBuild(ctx context.Context, cfg *config.Config) error {
 		return nil
 	}
 
-	if err := os.RemoveAll(cfg.WorkDir); err != nil && !os.IsNotExist(err) {
+	// CleanTarget, not RemoveAll: the work dir may be a mount point (the
+	// pivot path mounts a tmpfs there) and unlinking one fails with EBUSY.
+	if err := rootfs.CleanTarget(cfg.WorkDir); err != nil {
 		return fmt.Errorf("clean work dir: %w", err)
-	}
-	if err := os.MkdirAll(cfg.WorkDir, 0o755); err != nil {
-		return fmt.Errorf("create work dir: %w", err)
 	}
 
 	slog.Info("building rootfs", "layers", len(cfg.Layers), "target", cfg.WorkDir)

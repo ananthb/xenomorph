@@ -38,6 +38,8 @@ func bindCommon(fs *pflag.FlagSet, cfg *Config) {
 	fs.BoolVarP(&cfg.Verbose, "verbose", "v", false, "verbose output")
 	fs.BoolVar(&cfg.NoCache, "no-cache", false, "skip build cache, pull fresh")
 	fs.StringVar(&cfg.WorkDir, "work-dir", DefaultWorkDir, "working directory for rootfs extraction")
+	fs.StringVar(&cfg.RootfsSize, "rootfs-size", "", "size of the tmpfs holding the new rootfs (e.g. 512M, 2G, 50%); default: available RAM minus a 10% reserve")
+	fs.BoolVar(&cfg.NoRootfsTmpfs, "no-rootfs-tmpfs", false, "extract into --work-dir as-is instead of mounting a tmpfs over it")
 }
 
 func bindPivotOnly(fs *pflag.FlagSet, cfg *Config) {

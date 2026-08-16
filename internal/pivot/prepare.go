@@ -41,8 +41,20 @@ func Prepare(opts PrepareOptions) error {
 	// (This is why pivot_root recipes always bind the new root onto itself
 	// before populating it.) pivot_root also requires newRoot to be a mount
 	// point, which this satisfies.
-	if err := EnsureMountPoint(opts.NewRoot); err != nil {
-		return fmt.Errorf("bind new root onto itself: %w", err)
+	//
+	// Skipped when newRoot is already a mount in its own right — the normal
+	// case now that the orchestrator mounts a tmpfs there. The self-bind
+	// exists only to satisfy pivot_root's "new_root must be a mount point"
+	// rule; stacking a second mount to re-satisfy a rule that already holds
+	// just adds a mount to unwind.
+	alreadyMounted, err := IsMountPoint(opts.NewRoot)
+	if err != nil {
+		return fmt.Errorf("check whether new root is a mount point: %w", err)
+	}
+	if !alreadyMounted {
+		if err := EnsureMountPoint(opts.NewRoot); err != nil {
+			return fmt.Errorf("bind new root onto itself: %w", err)
+		}
 	}
 	if err := MakePrivate(opts.NewRoot); err != nil {
 		return fmt.Errorf("make new root private: %w", err)

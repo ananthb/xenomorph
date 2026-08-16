@@ -76,6 +76,29 @@ func readFrom(path string) (*MemInfo, error) {
 	return out, nil
 }
 
+// ReserveBytes is the RAM deliberately left unused by the new rootfs: 10% of
+// total. The same constant the headroom check enforces, expressed once so the
+// tmpfs we size and the check we run afterwards cannot disagree.
+func (m *MemInfo) ReserveBytes() uint64 { return m.Total / 10 }
+
+// RecommendRootfsBytes is the tmpfs size to give the new rootfs when the
+// operator did not choose one: everything currently available, minus the
+// reserve.
+//
+// Deliberately based on MemAvailable, not MemTotal. When the pivot runs the
+// old OS is still holding its memory, so sizing off total would hand out RAM
+// that is not actually free — turning an honest ENOSPC into an OOM kill
+// partway through the extract. That is the worse failure: the OOM killer
+// picks its own victim, and on a small host that is as likely to be sshd as
+// it is to be xmorph.
+func (m *MemInfo) RecommendRootfsBytes() uint64 {
+	reserve := m.ReserveBytes()
+	if m.Available <= reserve {
+		return 0
+	}
+	return m.Available - reserve
+}
+
 // HeadroomCheck is the same rule as src/cmd/pivot.zig:412-452 and
 // src/util/memory.zig:25-52: returns nil if at least 10% of total RAM
 // would remain free after a rootfs of rootfsBytes is placed in tmpfs.
