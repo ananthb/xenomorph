@@ -23,6 +23,7 @@ import (
 	"github.com/ananthb/xmorph/internal/tsnetauth"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 // errNotImplemented is retained for the not-yet-wired tsnet path (M6).
@@ -162,6 +163,10 @@ func runPivot(ctx context.Context, cfg *config.Config, stdout interface {
 
 	entrypoint, entryArgs, _ := resolveEntrypoint(cfg, result.Config)
 	slog.Info("entrypoint resolved", "entrypoint", entrypoint, "args", len(entryArgs))
+
+	if err := checkEntrypointSurvivesDetach(cfg, entrypoint); err != nil {
+		return err
+	}
 
 	// Write the postpivot config (read back by `xmorph --init`) and copy
 	// the running binary into the new rootfs.
@@ -421,21 +426,57 @@ func ensureLogDirWritable(dir string) error {
 	return os.Remove(name)
 }
 
-// serveOnly reports whether this pivot exists to expose SSH/Tailscale rather
-// than to run a program: services are enabled and the operator named neither
-// an entrypoint nor a command.
+// shellEntrypoints are the interactive shells an image is likely to name as
+// its default. Run detached they exit immediately; run from a console they
+// are perfectly reasonable.
+var shellEntrypoints = map[string]bool{
+	"sh": true, "bash": true, "ash": true, "dash": true, "zsh": true, "busybox": true,
+}
+
+// checkEntrypointSurvivesDetach refuses, before anything destructive happens,
+// to pivot into a bare shell that cannot survive being detached.
 //
-// The image's own default is deliberately ignored here. Minimal images
-// default to a shell (alpine's Cmd is ["/bin/sh"]), and a shell is precisely
-// what must not be supervised in this mode — driven over SSH there is no
-// terminal, so it reads EOF on stdin and exits before anyone connects,
-// taking the SSH server down with it. An operator who genuinely wants a
-// program run says so with --command or --entrypoint, and that still works.
-func serveOnly(cfg *config.Config) bool {
-	if cfg.EntrypointExplicit || len(cfg.Command) > 0 {
-		return false
+// A shell with no controlling terminal reads EOF on stdin and exits at once.
+// RebootOnExit makes that safe — the box returns to the OS on disk — but safe
+// is not useful: the operator wanted a machine they could reach, and instead
+// gets a pivot-reboot loop with the cause buried in a log on a filesystem
+// that just went away. Both the diagnosis and the fix are known here, while
+// the old root is still intact and aborting still costs nothing.
+//
+// Only the no-TTY case is rejected. With a console attached (--contain, or a
+// serial line) a shell is exactly what someone may want, so stdin decides.
+func checkEntrypointSurvivesDetach(cfg *config.Config, entrypoint string) error {
+	if cfg.Serve || cfg.Contain {
+		return nil
 	}
-	return cfg.SSHEnabled() || cfg.TailscaleEnabled()
+	if !shellEntrypoints[filepath.Base(entrypoint)] {
+		return nil
+	}
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		return nil
+	}
+	return fmt.Errorf(
+		"entrypoint %q is a shell with no terminal attached: it will read EOF on stdin "+
+			"and exit immediately after the pivot, rebooting the box back into the on-disk OS.\n"+
+			"  --serve            stay up serving SSH (what a remote rescue pivot wants)\n"+
+			"  --command ...      run a specific program instead\n"+
+			"  --entrypoint ...   override the image's default explicitly",
+		entrypoint)
+}
+
+// serveOnly reports whether to hold the box up for SSH instead of running a
+// program. This is the operator's explicit --serve and nothing else.
+//
+// It deliberately does not infer intent from the image. An earlier version
+// switched to serve mode whenever services were enabled and no command was
+// named, on the theory that the image's default shell could not have been
+// meant. That is wrong: an image whose Cmd is a real long-running daemon —
+// precisely what a purpose-built rescue image looks like — is
+// indistinguishable from alpine's ["/bin/sh"] at this point, so the guess
+// silently skips the very program the operator built the image around.
+// Honouring the image and rebooting on exit is predictable; guessing is not.
+func serveOnly(cfg *config.Config) bool {
+	return cfg.Serve
 }
 
 // resolveEntrypoint picks the effective entrypoint + args + env from the

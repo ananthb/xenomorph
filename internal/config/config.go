@@ -70,6 +70,9 @@ type Config struct {
 	Entrypoint         string
 	EntrypointExplicit bool
 	Command            []string
+	// Serve holds the box up serving SSH instead of running an entrypoint.
+	// Mutually exclusive with --entrypoint/--command.
+	Serve bool
 
 	KeepOldRoot string
 
