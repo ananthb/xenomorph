@@ -103,7 +103,11 @@ func printDryRun(w io.Writer, cfg *config.Config) {
 	step++
 	fmt.Fprintf(w, "  %d. Execute pivot_root\n", step)
 	step++
-	fmt.Fprintf(w, "  %d. Execute %s\n", step, cfg.Entrypoint)
+	if serveOnly(cfg) {
+		fmt.Fprintf(w, "  %d. Stay up and serve SSH (no entrypoint; reboots on exit)\n", step)
+	} else {
+		fmt.Fprintf(w, "  %d. Execute %s (reboots into the on-disk OS when it exits)\n", step, cfg.Entrypoint)
+	}
 
 	fmt.Fprintf(w, "\n=== END DRY RUN ===\n")
 }

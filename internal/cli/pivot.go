@@ -172,6 +172,11 @@ func runPivot(ctx context.Context, cfg *config.Config, stdout interface {
 	if err := postpivot.CopyBinary(cfg.WorkDir); err != nil {
 		return fmt.Errorf("copy binary: %w", err)
 	}
+	// Do this while the old root is still mounted — /etc/resolv.conf has to be
+	// read from it, and after the pivot the resolver it names is gone anyway.
+	if err := postpivot.EnsureResolvConf(cfg.WorkDir); err != nil {
+		return fmt.Errorf("prepare resolv.conf: %w", err)
+	}
 	slog.Info("staged post-pivot config and binary", "work_dir", cfg.WorkDir)
 
 	// Pre-pivot tailscale auth: validate the authkey against the live
@@ -339,7 +344,8 @@ func runPivot(ctx context.Context, cfg *config.Config, stdout interface {
 func buildPostpivotConfig(cfg *config.Config, entrypoint string, entryArgs []string) *postpivot.Config {
 	pc := &postpivot.Config{
 		FlushFirewall:          !cfg.KeepFirewall,
-		RebootOnFailure:        true,
+		RebootOnExit:           true,
+		Serve:                  serveOnly(cfg),
 		WatchdogTimeoutSeconds: int(cfg.WatchdogTimeout / time.Second),
 		KeepOldRoot:            cfg.KeepOldRoot,
 		Entrypoint:             append([]string{entrypoint}, entryArgs...),
@@ -413,6 +419,23 @@ func ensureLogDirWritable(dir string) error {
 	name := probe.Name()
 	probe.Close()
 	return os.Remove(name)
+}
+
+// serveOnly reports whether this pivot exists to expose SSH/Tailscale rather
+// than to run a program: services are enabled and the operator named neither
+// an entrypoint nor a command.
+//
+// The image's own default is deliberately ignored here. Minimal images
+// default to a shell (alpine's Cmd is ["/bin/sh"]), and a shell is precisely
+// what must not be supervised in this mode — driven over SSH there is no
+// terminal, so it reads EOF on stdin and exits before anyone connects,
+// taking the SSH server down with it. An operator who genuinely wants a
+// program run says so with --command or --entrypoint, and that still works.
+func serveOnly(cfg *config.Config) bool {
+	if cfg.EntrypointExplicit || len(cfg.Command) > 0 {
+		return false
+	}
+	return cfg.SSHEnabled() || cfg.TailscaleEnabled()
 }
 
 // resolveEntrypoint picks the effective entrypoint + args + env from the

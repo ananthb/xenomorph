@@ -103,6 +103,12 @@ func Run(argv []string) int {
 		}()
 	}
 
+	// No entrypoint to run: hold the box up and serve SSH. Returning here
+	// would leave a kernel with no userspace, so this blocks until signalled.
+	if cfg != nil && cfg.Serve {
+		return ServeUntilSignal()
+	}
+
 	// Decide what to exec. Config-supplied entrypoint+command beats argv.
 	var supervised []string
 	if cfg != nil && len(cfg.Entrypoint) > 0 {
@@ -116,16 +122,16 @@ func Run(argv []string) int {
 		return 1
 	}
 
-	rebootOnFailure := cfg == nil || cfg.RebootOnFailure
+	rebootOnExit := cfg == nil || cfg.RebootOnExit
 	var oldRoot string
 	if cfg != nil {
 		oldRoot = cfg.KeepOldRoot
 	}
 	code, err := Supervise(SuperviseOptions{
-		Argv:            supervised,
-		RebootOnFailure: rebootOnFailure,
-		OldRootPath:     oldRoot,
-		LogWriter:       entrypointLog,
+		Argv:         supervised,
+		RebootOnExit: rebootOnExit,
+		OldRootPath:  oldRoot,
+		LogWriter:    entrypointLog,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "xmorph --init: %v\n", err)
