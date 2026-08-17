@@ -174,7 +174,13 @@
           };
         };
 
-        checks = lib.optionalAttrs pkgs.stdenv.isLinux {
+        checks = let
+          lifecycleTests = import ./nix/tests/lifecycle.nix {
+            inherit pkgs;
+            lib = pkgs.lib;
+            xmorph-package = xmorph;
+          };
+        in lib.optionalAttrs pkgs.stdenv.isLinux {
           # Source build is the canonical sanity check.
           build = xmorph;
 
@@ -249,6 +255,13 @@
               machine.succeed("xmorph-oci.test -test.v")
             '';
           };
+
+          # End-to-end lifecycle: does the machine survive its own pivot?
+          # nixos-pivot proves pivot_root works; these prove the box is still
+          # there afterwards, which is the property that actually regressed.
+          nixos-lifecycle-idle = lifecycleTests.idle-stays-up;
+          nixos-lifecycle-exit-reboots = lifecycleTests.exit-reboots;
+          nixos-lifecycle-preflight = lifecycleTests.shell-refused-preflight;
 
           # NixOS VM test: headscale integration (offline, ~2-3 min)
           nixos-headscale = import ./nix/tests/headscale.nix {
