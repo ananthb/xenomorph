@@ -86,6 +86,21 @@ type Config struct {
 	CacheDir string
 	WorkDir  string
 
+	// RootfsSize is the size of the tmpfs mounted at WorkDir to hold the new
+	// rootfs: a byte count ("512M", "2G") or a percentage of total RAM
+	// ("50%"). Empty means auto — see sysmem.RecommendRootfsBytes.
+	//
+	// This exists because WorkDir defaults to a path under /run, and /run is
+	// itself a size-capped tmpfs (commonly 10-20% of RAM). Without our own
+	// mount the rootfs silently inherits that cap.
+	RootfsSize string
+
+	// NoRootfsTmpfs extracts straight into WorkDir instead of mounting a
+	// tmpfs over it. For the case where the operator has already arranged
+	// the storage — a pre-mounted tmpfs, or a disk that is not the one
+	// being overwritten.
+	NoRootfsTmpfs bool
+
 	// LogDir is an additional on-disk log sink: xmorph mirrors its slog
 	// output to {LogDir}/xmorph.log (alongside stderr/journald and syslog)
 	// and flushes the in-memory buffer there just before pivot_root, so the

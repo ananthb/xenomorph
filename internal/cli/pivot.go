@@ -20,6 +20,7 @@ import (
 	"github.com/ananthb/xmorph/internal/postpivot"
 	"github.com/ananthb/xmorph/internal/process"
 	"github.com/ananthb/xmorph/internal/rootfs"
+	"github.com/ananthb/xmorph/internal/sysmem"
 	"github.com/ananthb/xmorph/internal/tsnetauth"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
@@ -154,12 +155,96 @@ func runPivot(ctx context.Context, cfg *config.Config, stdout interface {
 		return fmt.Errorf("create work dir: %w", err)
 	}
 
+	// Give the new rootfs its own tmpfs, sized explicitly.
+	//
+	// Without this the rootfs is extracted into whatever filesystem WorkDir
+	// happens to land in — by default /run, which is itself a tmpfs capped
+	// at a fraction of RAM (83 MiB on a 415 MiB host). The extract then dies
+	// with ENOSPC well before RAM is exhausted, and the error points at a
+	// random file rather than at the real cause. Our own mount makes the
+	// budget explicit and independent of the host's /run sizing.
+	mem, err := sysmem.Read()
+	if err != nil {
+		return fmt.Errorf("read meminfo: %w", err)
+	}
+	var rootfsBudget uint64
+	if cfg.NoRootfsTmpfs {
+		free, err := pivot.FreeBytes(cfg.WorkDir)
+		if err != nil {
+			return fmt.Errorf("statfs %s: %w", cfg.WorkDir, err)
+		}
+		rootfsBudget = free
+		slog.Info("using --work-dir as-is (no tmpfs)", "dir", cfg.WorkDir, "free_mib", free>>20)
+	} else {
+		mounted, err := pivot.IsMountPoint(cfg.WorkDir)
+		if err != nil {
+			return fmt.Errorf("check %s: %w", cfg.WorkDir, err)
+		}
+		if mounted {
+			// A leftover from an aborted run, or an operator-arranged mount.
+			// Reusing it silently would hide its size, so say so.
+			free, _ := pivot.FreeBytes(cfg.WorkDir)
+			rootfsBudget = free
+			slog.Warn("work dir is already a mount point; reusing it instead of mounting a tmpfs",
+				"dir", cfg.WorkDir, "free_mib", free>>20)
+			// A reused mount may hold a half-extracted rootfs from an
+			// aborted run. Layering a new rootfs over those leftovers is
+			// how you get a system that boots with two distros' worth of
+			// /etc, so empty it first.
+			if err := rootfs.CleanTarget(cfg.WorkDir); err != nil {
+				return fmt.Errorf("clean reused work dir: %w", err)
+			}
+		} else {
+			if cfg.RootfsSize != "" {
+				rootfsBudget, err = config.ParseSize(cfg.RootfsSize, mem.Total)
+				if err != nil {
+					return fmt.Errorf("--rootfs-size: %w", err)
+				}
+			} else {
+				rootfsBudget = mem.RecommendRootfsBytes()
+			}
+			if rootfsBudget == 0 {
+				return fmt.Errorf("no RAM available for a rootfs: %d MiB available, %d MiB total, %d MiB reserved",
+					mem.Available>>20, mem.Total>>20, mem.ReserveBytes()>>20)
+			}
+			// A tmpfs bigger than available RAM is not an error the kernel
+			// will report — it just gets swapped or OOMs mid-extract. Refuse
+			// while the old OS is still alive to say so.
+			if warn, err := mem.HeadroomCheck(rootfsBudget); err != nil {
+				return fmt.Errorf("%w (requested rootfs tmpfs of %d MiB; lower --rootfs-size or free memory first)",
+					err, rootfsBudget>>20)
+			} else if warn {
+				slog.Warn("rootfs tmpfs leaves little headroom; a large rootfs may OOM mid-extract",
+					"size_mib", rootfsBudget>>20, "available_mib", mem.Available>>20)
+			}
+			if err := pivot.MountTmpfs(cfg.WorkDir, rootfsBudget); err != nil {
+				return err
+			}
+			slog.Info("mounted rootfs tmpfs", "dir", cfg.WorkDir, "size_mib", rootfsBudget>>20,
+				"available_mib", mem.Available>>20, "total_mib", mem.Total>>20)
+			// Unmount on any abort before the pivot. unix.Exec never returns
+			// on success, so reaching a return at all means we are staying on
+			// the old OS — where leaving a RAM-backed copy of the rootfs
+			// pinned would be a slow leak on a host we just decided not to
+			// replace. No error check: "we returned" IS the abort signal.
+			defer func() { _ = pivot.UnmountTmpfs(cfg.WorkDir) }()
+		}
+	}
+
 	slog.Info("building rootfs", "layers", len(cfg.Layers), "target", cfg.WorkDir)
 	result, err := rootfs.Build(cfg.Layers, cfg.WorkDir)
 	if err != nil {
-		return fmt.Errorf("build rootfs: %w", err)
+		// ENOSPC here means the budget was too small, which is worth saying
+		// plainly — it is the single most common way this step fails.
+		return fmt.Errorf("build rootfs (tmpfs budget %d MiB — raise --rootfs-size if this was ENOSPC): %w",
+			rootfsBudget>>20, err)
 	}
-	slog.Info("rootfs built", "layers", result.LayerCount)
+	if used, uerr := pivot.UsageBytes(cfg.WorkDir); uerr == nil {
+		slog.Info("rootfs built", "layers", result.LayerCount, "size_mib", used>>20,
+			"budget_mib", rootfsBudget>>20)
+	} else {
+		slog.Info("rootfs built", "layers", result.LayerCount)
+	}
 
 	entrypoint, entryArgs, _ := resolveEntrypoint(cfg, result.Config)
 	slog.Info("entrypoint resolved", "entrypoint", entrypoint, "args", len(entryArgs))
@@ -387,11 +472,10 @@ func runContain(cfg *config.Config) error {
 	}
 
 	slog.Info("building rootfs for --contain", "layers", len(cfg.Layers), "target", cfg.WorkDir)
-	if err := os.RemoveAll(cfg.WorkDir); err != nil && !os.IsNotExist(err) {
+	// CleanTarget, not RemoveAll: the work dir may be a mount point (the
+	// pivot path mounts a tmpfs there) and unlinking one fails with EBUSY.
+	if err := rootfs.CleanTarget(cfg.WorkDir); err != nil {
 		return fmt.Errorf("clean work dir: %w", err)
-	}
-	if err := os.MkdirAll(cfg.WorkDir, 0o755); err != nil {
-		return fmt.Errorf("create work dir: %w", err)
 	}
 
 	result, err := rootfs.Build(cfg.Layers, cfg.WorkDir)
