@@ -13,9 +13,6 @@ var ErrInvalidTimeout = errors.New("timeout must be greater than zero")
 // ErrWatchdogTooShort is returned when --watchdog-timeout is set below one second.
 var ErrWatchdogTooShort = errors.New("watchdog-timeout must be at least 1s")
 
-// ErrServeWithCommand rejects --serve alongside --entrypoint/--command.
-var ErrServeWithCommand = errors.New("--serve runs no entrypoint; drop --entrypoint/--command, or drop --serve to run them")
-
 // Validate runs the same set of post-parse checks as src/config.zig:598-626,
 // minus the containerfile mutual-exclusion rule (containerfile support was
 // dropped). Warnings go to warnW (typically os.Stderr).
@@ -26,13 +23,6 @@ func (c *Config) Validate(warnW io.Writer) error {
 
 	if c.WatchdogTimeout != 0 && c.WatchdogTimeout < time.Second {
 		return ErrWatchdogTooShort
-	}
-
-	// --serve runs nothing, so naming something to run contradicts it. Reject
-	// rather than pick a winner: either choice silently discards what the
-	// operator asked for, and this is the last cheap moment to say so.
-	if c.Serve && (c.EntrypointExplicit || len(c.Command) > 0) {
-		return ErrServeWithCommand
 	}
 
 	if c.TailscaleAuthkey == "" {

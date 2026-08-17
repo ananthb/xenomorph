@@ -28,10 +28,6 @@ type Config struct {
 	// whatever its status. See SuperviseOptions.RebootOnExit for why a
 	// clean exit is treated as fatal too.
 	RebootOnExit bool `json:"reboot_on_exit"`
-	// Serve means "there is no entrypoint; stay up and serve SSH until
-	// signalled". Set when the operator enabled SSH or Tailscale but named
-	// no command to run, which is the normal shape of a remote rescue pivot.
-	Serve bool `json:"serve,omitempty"`
 	// WatchdogTimeoutSeconds; 0 disables.
 	WatchdogTimeoutSeconds int `json:"watchdog_timeout_seconds,omitempty"`
 	// KeepOldRoot is the pre-pivot root's mount point (default

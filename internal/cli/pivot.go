@@ -350,7 +350,6 @@ func buildPostpivotConfig(cfg *config.Config, entrypoint string, entryArgs []str
 	pc := &postpivot.Config{
 		FlushFirewall:          !cfg.KeepFirewall,
 		RebootOnExit:           true,
-		Serve:                  serveOnly(cfg),
 		WatchdogTimeoutSeconds: int(cfg.WatchdogTimeout / time.Second),
 		KeepOldRoot:            cfg.KeepOldRoot,
 		Entrypoint:             append([]string{entrypoint}, entryArgs...),
@@ -446,7 +445,7 @@ var shellEntrypoints = map[string]bool{
 // Only the no-TTY case is rejected. With a console attached (--contain, or a
 // serial line) a shell is exactly what someone may want, so stdin decides.
 func checkEntrypointSurvivesDetach(cfg *config.Config, entrypoint string) error {
-	if cfg.Serve || cfg.Contain {
+	if cfg.Contain {
 		return nil
 	}
 	if !shellEntrypoints[filepath.Base(entrypoint)] {
@@ -458,25 +457,9 @@ func checkEntrypointSurvivesDetach(cfg *config.Config, entrypoint string) error 
 	return fmt.Errorf(
 		"entrypoint %q is a shell with no terminal attached: it will read EOF on stdin "+
 			"and exit immediately after the pivot, rebooting the box back into the on-disk OS.\n"+
-			"  --serve            stay up serving SSH (what a remote rescue pivot wants)\n"+
-			"  --command ...      run a specific program instead\n"+
-			"  --entrypoint ...   override the image's default explicitly",
-		entrypoint)
-}
-
-// serveOnly reports whether to hold the box up for SSH instead of running a
-// program. This is the operator's explicit --serve and nothing else.
-//
-// It deliberately does not infer intent from the image. An earlier version
-// switched to serve mode whenever services were enabled and no command was
-// named, on the theory that the image's default shell could not have been
-// meant. That is wrong: an image whose Cmd is a real long-running daemon —
-// precisely what a purpose-built rescue image looks like — is
-// indistinguishable from alpine's ["/bin/sh"] at this point, so the guess
-// silently skips the very program the operator built the image around.
-// Honouring the image and rebooting on exit is predictable; guessing is not.
-func serveOnly(cfg *config.Config) bool {
-	return cfg.Serve
+			"  --entrypoint %s --cmd idle   stay up and reachable, running nothing\n"+
+			"  --command ...                run a specific program instead",
+		entrypoint, postpivot.BinaryPath)
 }
 
 // resolveEntrypoint picks the effective entrypoint + args + env from the

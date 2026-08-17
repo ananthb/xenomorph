@@ -12,7 +12,6 @@ func TestWriteConfigRoundTrip(t *testing.T) {
 	cfg := &Config{
 		FlushFirewall:          true,
 		RebootOnExit:           true,
-		Serve:                  true,
 		WatchdogTimeoutSeconds: 300,
 		KeepOldRoot:            "/mnt/oldroot",
 		LogPersistDir:          "/mnt/oldroot/var/log/xmorph",
@@ -40,7 +39,7 @@ func TestWriteConfigRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if !got.FlushFirewall || !got.RebootOnExit || !got.Serve {
+	if !got.FlushFirewall || !got.RebootOnExit {
 		t.Error("boolean fields lost")
 	}
 	if got.WatchdogTimeoutSeconds != 300 {

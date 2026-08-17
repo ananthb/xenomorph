@@ -103,12 +103,6 @@ func Run(argv []string) int {
 		}()
 	}
 
-	// No entrypoint to run: hold the box up and serve SSH. Returning here
-	// would leave a kernel with no userspace, so this blocks until signalled.
-	if cfg != nil && cfg.Serve {
-		return ServeUntilSignal()
-	}
-
 	// Decide what to exec. Config-supplied entrypoint+command beats argv.
 	var supervised []string
 	if cfg != nil && len(cfg.Entrypoint) > 0 {
@@ -120,6 +114,17 @@ func Run(argv []string) int {
 	if len(supervised) == 0 {
 		fmt.Fprintln(os.Stderr, "xmorph --init: no entrypoint")
 		return 1
+	}
+
+	// `xmorph idle` blocks until signalled, which is exactly what this
+	// supervisor would do while waiting on it. Recognise our own binary and
+	// block here rather than forking a second copy — on the small machines
+	// this tool targets, a redundant Go runtime is real memory in a
+	// tmpfs-backed rootfs. Purely an optimisation; the semantics are the
+	// entrypoint's either way.
+	if len(supervised) == 2 && supervised[0] == BinaryPath && supervised[1] == "idle" {
+		slog.Info("entrypoint is xmorph idle; blocking in the supervisor")
+		return ServeUntilSignal()
 	}
 
 	rebootOnExit := cfg == nil || cfg.RebootOnExit

@@ -51,8 +51,6 @@ func bindPivotOnly(fs *pflag.FlagSet, cfg *Config) {
 	fs.Var(&appendStringVar{dst: &cfg.Command}, "command", "command/args passed to entrypoint (repeatable)")
 	fs.Var(&appendStringVar{dst: &cfg.Command}, "cmd", "alias for --command")
 
-	fs.BoolVar(&cfg.Serve, "serve", false, "run no entrypoint; stay up serving SSH until stopped")
-
 	// --keep-old-root with optional value: bare form uses the default,
 	// --keep-old-root=/foo overrides. --no-keep-old-root clears it.
 	fs.StringVar(&cfg.KeepOldRoot, "keep-old-root", DefaultKeepOldRoot, "keep old root mounted at PATH after pivot (default /mnt/oldroot)")

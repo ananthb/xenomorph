@@ -92,7 +92,7 @@ supports unattended operation over Tailscale (in-process via tsnet).`,
 	// InitDefaultVersionFlag sees an existing flag and leaves it alone.
 	root.Flags().BoolP("version", "V", false, "print version and exit")
 
-	root.AddCommand(newPivotCmd(), newBuildCmd(), newVersionCmd())
+	root.AddCommand(newPivotCmd(), newBuildCmd(), newIdleCmd(), newVersionCmd())
 	return root
 }
 
