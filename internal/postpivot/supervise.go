@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -32,10 +33,22 @@ type SuperviseOptions struct {
 	Argv []string
 	// Env is the environment passed to the entrypoint. Nil = inherit.
 	Env []string
-	// RebootOnFailure: if true and the entrypoint exits non-zero (or by
-	// signal), sync the filesystem and trigger LINUX_REBOOT_CMD_RESTART
-	// so the original OS comes back. Mirrors src/xenomorph-init.zig:336-352.
-	RebootOnFailure bool
+	// RebootOnExit: if true, sync the filesystem and trigger
+	// LINUX_REBOOT_CMD_RESTART when the entrypoint exits — for ANY exit,
+	// including a clean status 0.
+	//
+	// Post-pivot there is no init left to fall back to: the old root's
+	// systemd was torn down before pivot_root, and this supervisor is the
+	// only thing keeping userspace alive. When it returns, the box is a
+	// running kernel with nothing on it — it still answers ICMP (the kernel
+	// does that), so it looks alive from outside while being unreachable and
+	// unrecoverable without physical access.
+	//
+	// A clean exit is the *likely* case, not the exotic one: the default
+	// entrypoint is a shell, and a shell whose stdin is /dev/null reads EOF
+	// and exits 0 immediately. Rebooting instead returns the machine to the
+	// OS on disk, which is always a better end state than bricked-alive.
+	RebootOnExit bool
 	// OldRootPath is unmounted before reboot; empty skips.
 	OldRootPath string
 	// LogWriter, if non-nil, tees the child's stdout + stderr.
@@ -91,10 +104,49 @@ func Supervise(opts SuperviseOptions) (exitCode int, err error) {
 			signal.Stop(sigCh)
 			reapOrphans()
 			code := exitStatusFrom(cmd, err)
-			if opts.RebootOnFailure && code != 0 {
+			if opts.RebootOnExit {
+				slog.Warn("entrypoint exited; no userspace left, rebooting into the on-disk OS",
+					"code", code)
 				rebootSystem(opts.OldRootPath)
 			}
 			return code, nil
+		}
+	}
+}
+
+// ServeUntilSignal blocks until TERM/INT is received, reaping orphans as
+// they appear. It is the entrypoint for a pivot whose purpose is to expose
+// SSH and Tailscale rather than to run a program.
+//
+// This exists because the obvious alternative — supervising `/bin/sh` — is
+// wrong for a remotely-driven pivot. There is no terminal on the other end,
+// so the shell's stdin is /dev/null (or a closed pipe), it reads EOF, and it
+// exits before anyone can connect. Telling users to pass `sleep infinity`
+// works but makes the tool's headline use case depend on a shell idiom and on
+// coreutils being present in the image. Blocking here needs neither: no
+// /bin/sh, no sleep, nothing from the image at all.
+//
+// SIGCHLD is deliberately not a wake-up condition. As the supervisor we
+// inherit every orphan on the box, so children will come and go; that is
+// not a reason to tear down the SSH server the operator is relying on.
+func ServeUntilSignal() int {
+	sigCh := make(chan os.Signal, 8)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+
+	chldCh := make(chan os.Signal, 8)
+	signal.Notify(chldCh, syscall.SIGCHLD)
+	defer signal.Stop(chldCh)
+
+	slog.Info("serving; no entrypoint to supervise (send SIGTERM to stop)")
+	for {
+		select {
+		case sig := <-sigCh:
+			slog.Info("received signal, stopping", "signal", sig)
+			reapOrphans()
+			return 0
+		case <-chldCh:
+			reapOrphans()
 		}
 	}
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/ananthb/xmorph/internal/tsnetauth"
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 // errNotImplemented is retained for the not-yet-wired tsnet path (M6).
@@ -163,6 +164,10 @@ func runPivot(ctx context.Context, cfg *config.Config, stdout interface {
 	entrypoint, entryArgs, _ := resolveEntrypoint(cfg, result.Config)
 	slog.Info("entrypoint resolved", "entrypoint", entrypoint, "args", len(entryArgs))
 
+	if err := checkEntrypointSurvivesDetach(cfg, entrypoint); err != nil {
+		return err
+	}
+
 	// Write the postpivot config (read back by `xmorph --init`) and copy
 	// the running binary into the new rootfs.
 	pivotConfig := buildPostpivotConfig(cfg, entrypoint, entryArgs)
@@ -171,6 +176,11 @@ func runPivot(ctx context.Context, cfg *config.Config, stdout interface {
 	}
 	if err := postpivot.CopyBinary(cfg.WorkDir); err != nil {
 		return fmt.Errorf("copy binary: %w", err)
+	}
+	// Do this while the old root is still mounted — /etc/resolv.conf has to be
+	// read from it, and after the pivot the resolver it names is gone anyway.
+	if err := postpivot.EnsureResolvConf(cfg.WorkDir); err != nil {
+		return fmt.Errorf("prepare resolv.conf: %w", err)
 	}
 	slog.Info("staged post-pivot config and binary", "work_dir", cfg.WorkDir)
 
@@ -339,7 +349,7 @@ func runPivot(ctx context.Context, cfg *config.Config, stdout interface {
 func buildPostpivotConfig(cfg *config.Config, entrypoint string, entryArgs []string) *postpivot.Config {
 	pc := &postpivot.Config{
 		FlushFirewall:          !cfg.KeepFirewall,
-		RebootOnFailure:        true,
+		RebootOnExit:           true,
 		WatchdogTimeoutSeconds: int(cfg.WatchdogTimeout / time.Second),
 		KeepOldRoot:            cfg.KeepOldRoot,
 		Entrypoint:             append([]string{entrypoint}, entryArgs...),
@@ -413,6 +423,43 @@ func ensureLogDirWritable(dir string) error {
 	name := probe.Name()
 	probe.Close()
 	return os.Remove(name)
+}
+
+// shellEntrypoints are the interactive shells an image is likely to name as
+// its default. Run detached they exit immediately; run from a console they
+// are perfectly reasonable.
+var shellEntrypoints = map[string]bool{
+	"sh": true, "bash": true, "ash": true, "dash": true, "zsh": true, "busybox": true,
+}
+
+// checkEntrypointSurvivesDetach refuses, before anything destructive happens,
+// to pivot into a bare shell that cannot survive being detached.
+//
+// A shell with no controlling terminal reads EOF on stdin and exits at once.
+// RebootOnExit makes that safe — the box returns to the OS on disk — but safe
+// is not useful: the operator wanted a machine they could reach, and instead
+// gets a pivot-reboot loop with the cause buried in a log on a filesystem
+// that just went away. Both the diagnosis and the fix are known here, while
+// the old root is still intact and aborting still costs nothing.
+//
+// Only the no-TTY case is rejected. With a console attached (--contain, or a
+// serial line) a shell is exactly what someone may want, so stdin decides.
+func checkEntrypointSurvivesDetach(cfg *config.Config, entrypoint string) error {
+	if cfg.Contain {
+		return nil
+	}
+	if !shellEntrypoints[filepath.Base(entrypoint)] {
+		return nil
+	}
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		return nil
+	}
+	return fmt.Errorf(
+		"entrypoint %q is a shell with no terminal attached: it will read EOF on stdin "+
+			"and exit immediately after the pivot, rebooting the box back into the on-disk OS.\n"+
+			"  --entrypoint %s --cmd idle   stay up and reachable, running nothing\n"+
+			"  --command ...                run a specific program instead",
+		entrypoint, postpivot.BinaryPath)
 }
 
 // resolveEntrypoint picks the effective entrypoint + args + env from the

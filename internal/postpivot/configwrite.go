@@ -23,8 +23,11 @@ const BinaryPath = "/usr/local/bin/xmorph"
 // Config is the JSON schema written to ConfigPath. Mirrors the schema
 // at the top of src/xenomorph-init.zig.
 type Config struct {
-	FlushFirewall   bool `json:"flush_firewall"`
-	RebootOnFailure bool `json:"reboot_on_failure"`
+	FlushFirewall bool `json:"flush_firewall"`
+	// RebootOnExit reboots into the on-disk OS when the entrypoint exits,
+	// whatever its status. See SuperviseOptions.RebootOnExit for why a
+	// clean exit is treated as fatal too.
+	RebootOnExit bool `json:"reboot_on_exit"`
 	// WatchdogTimeoutSeconds; 0 disables.
 	WatchdogTimeoutSeconds int `json:"watchdog_timeout_seconds,omitempty"`
 	// KeepOldRoot is the pre-pivot root's mount point (default

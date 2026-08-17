@@ -116,16 +116,27 @@ func Run(argv []string) int {
 		return 1
 	}
 
-	rebootOnFailure := cfg == nil || cfg.RebootOnFailure
+	// `xmorph idle` blocks until signalled, which is exactly what this
+	// supervisor would do while waiting on it. Recognise our own binary and
+	// block here rather than forking a second copy — on the small machines
+	// this tool targets, a redundant Go runtime is real memory in a
+	// tmpfs-backed rootfs. Purely an optimisation; the semantics are the
+	// entrypoint's either way.
+	if len(supervised) == 2 && supervised[0] == BinaryPath && supervised[1] == "idle" {
+		slog.Info("entrypoint is xmorph idle; blocking in the supervisor")
+		return ServeUntilSignal()
+	}
+
+	rebootOnExit := cfg == nil || cfg.RebootOnExit
 	var oldRoot string
 	if cfg != nil {
 		oldRoot = cfg.KeepOldRoot
 	}
 	code, err := Supervise(SuperviseOptions{
-		Argv:            supervised,
-		RebootOnFailure: rebootOnFailure,
-		OldRootPath:     oldRoot,
-		LogWriter:       entrypointLog,
+		Argv:         supervised,
+		RebootOnExit: rebootOnExit,
+		OldRootPath:  oldRoot,
+		LogWriter:    entrypointLog,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "xmorph --init: %v\n", err)
