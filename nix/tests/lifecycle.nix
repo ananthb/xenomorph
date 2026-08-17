@@ -39,10 +39,13 @@ let
   # A pivot detached from the calling session, exactly as an operator would run
   # it over SSH. Output goes to the console, which is the only channel that
   # outlives the old root.
-  pivotCmd = args: ''
-    setsid nohup xmorph pivot --force --rootfs ${test-rootfs} \
-      --no-init-coord ${args} > /dev/console 2>&1 < /dev/null &
-  '';
+  #
+  # Deliberately one line: this gets interpolated into a Python string literal
+  # in the test script, and a shell `\` continuation would put a raw newline
+  # inside that literal, which Python rejects before the VM ever boots.
+  pivotCmd = args:
+    "setsid nohup xmorph pivot --force --rootfs ${test-rootfs} --no-init-coord "
+    + "${args} > /dev/console 2>&1 < /dev/null &";
 in
 {
   # The headline case: a rescue pivot must leave the machine UP.
@@ -69,11 +72,16 @@ in
       # And it has to KEEP holding. A machine that pivots and then reboots
       # moments later is the loop this design exists to avoid, so watch for the
       # reboot banner and treat seeing it as the failure.
+      # Set a flag rather than raising inside the try: the driver's timeout
+      # exception type varies across nixpkgs, so the except has to be broad —
+      # and a broad except would swallow the failure we are trying to report.
+      rebooted = False
       try:
           machine.wait_for_console_text("no userspace left, rebooting", timeout=30)
-          raise Exception("machine rebooted after pivoting; idle did not hold it up")
-      except TimeoutError:
+          rebooted = True
+      except Exception:
           pass
+      assert not rebooted, "machine rebooted after pivoting; idle did not hold it up"
     '';
   };
 
