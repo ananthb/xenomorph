@@ -112,6 +112,16 @@ in
       # moments later is the loop this design exists to avoid.
       prober.succeed("sleep 20")
       prober.succeed("nc -z -w 2 target 22")
+
+      # Pull the plug, and do it here rather than leaving it to the driver.
+      # When the script ends the driver runs execute("sync") on every machine
+      # that is_up(), and execute() calls connect(), which waits on the
+      # backdoor shell in a loop with no way out. The backdoor died with the
+      # old root — that is the premise of this whole test — so the run would
+      # sit there until the global timeout and be scored as a failure with
+      # every assertion already passed. crash() goes through QMP and needs
+      # nothing from the guest.
+      target.crash()
     '';
   };
 
