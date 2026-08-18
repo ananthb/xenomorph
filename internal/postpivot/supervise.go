@@ -107,7 +107,7 @@ func Supervise(opts SuperviseOptions) (exitCode int, err error) {
 			if opts.RebootOnExit {
 				slog.Warn("entrypoint exited; no userspace left, rebooting into the on-disk OS",
 					"code", code)
-				rebootSystem(opts.OldRootPath)
+				rebootHook(opts.OldRootPath)
 			}
 			return code, nil
 		}
@@ -181,6 +181,17 @@ func exitStatusFrom(cmd *exec.Cmd, waitErr error) int {
 	}
 	return 0
 }
+
+// rebootHook is what Supervise calls once it decides the machine has to go
+// back to the OS on disk. It is a variable so tests can assert on that
+// decision: the real implementation never returns, and a test that reboots
+// the machine running it is not a test.
+//
+// "Did we decide to reboot?" is the whole of the bug this indirection exists
+// for. A pivot that leaves a kernel with no userspace needs someone on site
+// with a power cable, so the decision has to be checked on every push, not
+// only when a VM happens to be available.
+var rebootHook = rebootSystem
 
 // rebootSystem sleeps 5s (for log flush), then hands off to the
 // platform doReboot.

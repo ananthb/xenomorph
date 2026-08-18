@@ -50,6 +50,15 @@ jobs:
       - name: pivot_root + extraction VM test
         run: nix build -L .#checks.x86_64-linux.nixos-pivot
 
+      # Lifecycle: the machine must survive its own pivot, reboot when the
+      # entrypoint exits, and refuse a shell entrypoint before doing damage.
+      # These are the regressions nixos-pivot cannot see.
+      - name: pivot lifecycle VM tests
+        run: |
+          nix build -L .#checks.x86_64-linux.nixos-lifecycle-idle
+          nix build -L .#checks.x86_64-linux.nixos-lifecycle-exit-reboots
+          nix build -L .#checks.x86_64-linux.nixos-lifecycle-preflight
+
   goreleaser-check:
     name: goreleaser check + snapshot smoke test
     runs-on: ubuntu-latest
