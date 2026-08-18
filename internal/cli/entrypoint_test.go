@@ -59,3 +59,47 @@ func TestEntrypointRefusalNamesTheFix(t *testing.T) {
 		}
 	}
 }
+
+// --ssh.enable with no credentials produced a machine that pivoted, stayed up,
+// and could not be logged into: sshd logged "no auth method configured" to a
+// console nobody was reading and never bound the port. The VM test found it.
+func TestCheckSSHUsable(t *testing.T) {
+	enabled := true
+	for _, tc := range []struct {
+		name    string
+		cfg     config.Config
+		wantErr bool
+	}{
+		{name: "ssh off", cfg: config.Config{}},
+		{
+			name:    "enabled with nothing to authenticate with",
+			cfg:     config.Config{SSHEnable: &enabled},
+			wantErr: true,
+		},
+		{
+			name: "password",
+			cfg:  config.Config{SSHEnable: &enabled, SSHPassword: "hunter2"},
+		},
+		{
+			name: "authorized keys",
+			cfg:  config.Config{SSHEnable: &enabled, SSHAuthorizedKeys: "ssh-ed25519 AAAA"},
+		},
+		// SSHEnabled() is implied by any other ssh.* flag, so this is on too.
+		{name: "implied by password alone", cfg: config.Config{SSHPassword: "hunter2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkSSHUsable(&tc.cfg)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("checkSSHUsable() = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err == nil {
+				return
+			}
+			for _, want := range []string{"--ssh.authorized-keys", "--ssh.password"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal does not mention %q: %v", want, err)
+				}
+			}
+		})
+	}
+}

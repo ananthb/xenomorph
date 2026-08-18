@@ -167,6 +167,9 @@ func runPivot(ctx context.Context, cfg *config.Config, stdout interface {
 	if err := checkEntrypointSurvivesDetach(cfg, entrypoint); err != nil {
 		return err
 	}
+	if err := checkSSHUsable(cfg); err != nil {
+		return err
+	}
 
 	// Write the postpivot config (read back by `xmorph --init`) and copy
 	// the running binary into the new rootfs.
@@ -460,6 +463,30 @@ func checkEntrypointSurvivesDetach(cfg *config.Config, entrypoint string) error 
 			"  --entrypoint %s --cmd idle   stay up and reachable, running nothing\n"+
 			"  --command ...                run a specific program instead",
 		entrypoint, postpivot.BinaryPath)
+}
+
+// checkSSHUsable refuses a pivot that asks for SSH without any way to
+// authenticate to it.
+//
+// The post-pivot sshd needs a password or authorized keys; given neither it
+// logs an error and never listens. That log goes to a console nobody is
+// reading, on a machine whose whole reason for pivoting was to be reachable —
+// so `--ssh.enable` on its own hands back a box that is up, healthy, holding
+// itself open, and impossible to get into. Cheaper to say so here.
+//
+// Found by nix/tests/lifecycle.nix, which is what those tests are for.
+func checkSSHUsable(cfg *config.Config) error {
+	if !cfg.SSHEnabled() {
+		return nil
+	}
+	if cfg.SSHPassword != "" || cfg.SSHAuthorizedKeys != "" {
+		return nil
+	}
+	return errors.New(
+		"SSH is enabled but has no way to authenticate anyone: sshd will refuse " +
+			"to start and the pivoted machine will be unreachable.\n" +
+			"  --ssh.authorized-keys '<pubkey>'   let a key in\n" +
+			"  --ssh.password '<password>'        let a password in")
 }
 
 // resolveEntrypoint picks the effective entrypoint + args + env from the

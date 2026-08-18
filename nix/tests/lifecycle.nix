@@ -95,8 +95,10 @@ in
       # Nothing is listening yet — otherwise the assertion below proves nothing.
       prober.fail("nc -z -w 2 target 22")
 
+      # A password, because sshd will not start without one — nothing here
+      # authenticates, the assertion is only that the port answers.
       target.execute(
-          "${pivotCmd "--entrypoint /usr/local/bin/xmorph --cmd idle --ssh.enable"}"
+          "${pivotCmd "--entrypoint /usr/local/bin/xmorph --cmd idle --ssh.password=lifecycle-test"}"
       )
 
       # xmorph idle logs this once it is holding the box up.
