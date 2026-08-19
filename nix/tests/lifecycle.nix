@@ -18,8 +18,8 @@
 #
 #   * The guest is booted with `console=ttyS0 console=tty0`, and the last one
 #     wins: /dev/console is the graphics console, which the driver never reads.
-#     wait_for_console_text watches the serial line. Output has to go to
-#     /dev/ttyS0 by name — writing to /dev/console is silence.
+#     The driver watches the serial line, so output has to go to /dev/ttyS0 by
+#     name — writing to /dev/console is silence.
 #
 # The same properties are asserted far more cheaply by the Go tests in
 # internal/postpivot/lifecycle_test.go, which is where a regression will
@@ -53,6 +53,33 @@ let
     virtualisation.memorySize = 2048;
     networking.firewall.enable = false;
   };
+
+  # Console assertions do NOT go through wait_for_console_text. That method
+  # drains its queue with a single non-blocking get() per retry iteration, and
+  # retry sleeps a second between iterations — one line per second, against a
+  # NixOS boot that emits hundreds. Whether it matches in time is a race with
+  # the backlog: the same call took 33s in one CI run and blew a 180s timeout
+  # in the next, with the text present and correct on the console both times.
+  #
+  # full_console_log has everything since boot and is not consumed by reading
+  # it, so polling it is both faster and deterministic.
+  consoleHelper = ''
+    import re
+    import time
+
+
+    def wait_console(machine, pattern, timeout=180):
+        """Wait for pattern to appear anywhere in the console log; return the match."""
+        for _ in range(timeout):
+            match = re.search(pattern, machine.get_console_log())
+            if match:
+                return match
+            time.sleep(1)
+        raise Exception(
+            f"{pattern!r} never appeared on the console:\\n"
+            + machine.get_console_log()[-4000:]
+        )
+  '';
 
   # Launch a pivot the way an operator does: detached, no terminal, output on
   # the serial console because every other channel goes away with the old root.
@@ -93,8 +120,7 @@ in
       };
     };
     testScript = ''
-      import re
-      import time
+      ${consoleHelper}
 
       start_all()
       target.wait_for_unit("multi-user.target")
@@ -123,7 +149,7 @@ in
           )
 
           # xmorph idle logs this once it is holding the box up.
-          target.wait_for_console_text("serving; no entrypoint to supervise", timeout=180)
+          wait_console(target, "serving; no entrypoint to supervise")
 
           # The real assertion, and the only one that distinguishes this from
           # the incident: someone else can still open a connection to it.
@@ -131,27 +157,13 @@ in
 
           # A generated password nobody can read is the same failure wearing a
           # different hat, so take it the way an operator does — off the
-          # console.
-          #
-          # Not wait_for_console_text: that reads forward from a queue, and
-          # the banner is printed *before* the "serving" line above, so by now
-          # it is already in the past and waiting for it hangs until the
-          # timeout. get_console_log() is the whole log since boot, which is
-          # where it actually is. Poll it, so this does not depend on the
-          # order xmorph happens to log things in.
-          password = None
-          for _ in range(60):
-              match = re.search(
-                  r"generated a root password for it:\s+([a-z]{3,6}-[a-z]{3,6}-[a-z]{3,6})",
-                  target.get_console_log(),
-              )
-              if match:
-                  password = match.group(1)
-                  break
-              time.sleep(1)
-          assert password, (
-              "no password on the console:\n" + target.get_console_log()[-4000:]
-          )
+          # console. The banner is printed *before* the "serving" line above,
+          # so this has to search the whole log rather than wait forward.
+          password = wait_console(
+              target,
+              r"generated a root password for it:\s+([a-z]{3,6}-[a-z]{3,6}-[a-z]{3,6})",
+              timeout=60,
+          ).group(1)
 
           # And it has to actually let someone in. Force password auth so a
           # misconfigured sshd cannot pass this by accepting a key, or by
@@ -196,6 +208,8 @@ in
     name = "xmorph-lifecycle-exit-reboots";
     nodes.target = target;
     testScript = ''
+      ${consoleHelper}
+
       target.start(allow_reboot=True)
       target.wait_for_unit("multi-user.target")
       first_boot = target.succeed("cat /proc/sys/kernel/random/boot_id").strip()
@@ -212,7 +226,7 @@ in
       # failure path: when the reboot does happen the backdoor comes back and
       # the driver can shut down normally.
       try:
-          target.wait_for_console_text("no userspace left, rebooting", timeout=180)
+          wait_console(target, "no userspace left, rebooting")
 
           # The backdoor went down with the old root; the reboot brings a new one.
           target.connected = False
