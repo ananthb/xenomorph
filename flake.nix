@@ -116,11 +116,18 @@
           '' else ''
             # Native macOS test for pure-Go packages, plus compile check
             # of every package targeted at Linux.
-            go test ./internal/config/... ./internal/log/... ./internal/helpers/...
+            go test ./internal/config/... ./internal/log/... ./internal/helpers/... \
+              ./internal/passphrase/...
             tmp=$(mktemp -d)
             trap 'rm -rf "$tmp"' EXIT
             GOOS=linux CGO_ENABLED=0 go build -o "$tmp/xmorph" ./cmd/xmorph
             echo "linux cross-compile OK ($tmp/xmorph)"
+            # Compile the Linux-only test binaries too. Without this a broken
+            # _test.go in, say, internal/cli builds clean on a Mac and only
+            # fails in CI, which is a slow way to find a typo.
+            GOOS=linux CGO_ENABLED=0 go test -run=NONE -count=1 -exec=true ./... \
+              >/dev/null
+            echo "linux test compile OK"
           '';
         };
 

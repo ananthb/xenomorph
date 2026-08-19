@@ -16,6 +16,7 @@ import (
 	"github.com/ananthb/xmorph/internal/helpers"
 	"github.com/ananthb/xmorph/internal/initsys"
 	"github.com/ananthb/xmorph/internal/oci"
+	"github.com/ananthb/xmorph/internal/passphrase"
 	"github.com/ananthb/xmorph/internal/pivot"
 	"github.com/ananthb/xmorph/internal/postpivot"
 	"github.com/ananthb/xmorph/internal/process"
@@ -252,8 +253,12 @@ func runPivot(ctx context.Context, cfg *config.Config, stdout interface {
 	if err := checkEntrypointSurvivesDetach(cfg, entrypoint); err != nil {
 		return err
 	}
-	if err := checkSSHUsable(cfg); err != nil {
+	generatedPassword, err := ensureSSHUsable(cfg)
+	if err != nil {
 		return err
+	}
+	if generatedPassword != "" {
+		postpivot.AnnounceSSHPassword(os.Stderr, generatedPassword, int(sshPort(cfg)))
 	}
 
 	// Write the postpivot config (read back by `xmorph --init`) and copy
@@ -447,14 +452,11 @@ func buildPostpivotConfig(cfg *config.Config, entrypoint string, entryArgs []str
 	}
 	if cfg.SSHEnabled() {
 		ssh := &postpivot.SSHConfig{
-			Password:       cfg.SSHPassword,
-			AuthorizedKeys: cfg.SSHAuthorizedKeys,
+			Password:          cfg.SSHPassword,
+			PasswordGenerated: cfg.SSHPasswordGenerated,
+			AuthorizedKeys:    cfg.SSHAuthorizedKeys,
 		}
-		if cfg.SSHPort != nil {
-			ssh.Port = int(*cfg.SSHPort)
-		} else {
-			ssh.Port = 22
-		}
+		ssh.Port = int(sshPort(cfg))
 		pc.SSH = ssh
 	}
 	if cfg.TailscaleEnabled() {
@@ -549,28 +551,50 @@ func checkEntrypointSurvivesDetach(cfg *config.Config, entrypoint string) error 
 		entrypoint, postpivot.BinaryPath)
 }
 
-// checkSSHUsable refuses a pivot that asks for SSH without any way to
-// authenticate to it.
+// ensureSSHUsable makes sure a pivot that asks for SSH can actually be
+// logged into, generating a root password when the operator supplied no
+// credentials at all.
 //
 // The post-pivot sshd needs a password or authorized keys; given neither it
 // logs an error and never listens. That log goes to a console nobody is
 // reading, on a machine whose whole reason for pivoting was to be reachable —
-// so `--ssh.enable` on its own hands back a box that is up, healthy, holding
-// itself open, and impossible to get into. Cheaper to say so here.
+// so `--ssh.enable` on its own used to hand back a box that was up, healthy,
+// holding itself open, and impossible to get into.
+//
+// Generating one is better than refusing, because refusing pushes the
+// operator into inventing a password on a command line, under time pressure,
+// on the box they are about to take apart. Three random words beat that every
+// time. Returns the generated password so the caller can decide where to
+// announce it; empty means the operator brought their own credentials.
 //
 // Found by nix/tests/lifecycle.nix, which is what those tests are for.
-func checkSSHUsable(cfg *config.Config) error {
+func ensureSSHUsable(cfg *config.Config) (generated string, err error) {
 	if !cfg.SSHEnabled() {
-		return nil
+		return "", nil
 	}
 	if cfg.SSHPassword != "" || cfg.SSHAuthorizedKeys != "" {
-		return nil
+		return "", nil
 	}
-	return errors.New(
-		"SSH is enabled but has no way to authenticate anyone: sshd will refuse " +
-			"to start and the pivoted machine will be unreachable.\n" +
-			"  --ssh.authorized-keys '<pubkey>'   let a key in\n" +
-			"  --ssh.password '<password>'        let a password in")
+	pw, err := passphrase.New()
+	if err != nil {
+		// No randomness means no credential means an unreachable machine.
+		// Refuse here, where refusing is still free.
+		return "", fmt.Errorf(
+			"SSH is enabled with no credentials and no password could be generated: %w\n"+
+				"  --ssh.authorized-keys '<pubkey>'   let a key in\n"+
+				"  --ssh.password '<password>'        let a password in", err)
+	}
+	cfg.SSHPassword = pw
+	cfg.SSHPasswordGenerated = true
+	return pw, nil
+}
+
+// sshPort is the port the post-pivot sshd will bind, defaulting to 22.
+func sshPort(cfg *config.Config) uint16 {
+	if cfg.SSHPort != nil {
+		return *cfg.SSHPort
+	}
+	return 22
 }
 
 // resolveEntrypoint picks the effective entrypoint + args + env from the

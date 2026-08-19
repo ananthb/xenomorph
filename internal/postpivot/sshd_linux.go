@@ -293,14 +293,35 @@ func runSession(ch ssh.Channel, reqs <-chan *ssh.Request, cmd *exec.Cmd, term st
 		go handleWinCh(reqs, f)
 		_, _ = io.Copy(ch, f)
 	} else {
-		cmd.Stdin = ch
-		cmd.Stdout = ch
-		cmd.Stderr = ch.Stderr()
-		if err := cmd.Start(); err != nil {
+		// Deliberately not cmd.Stdin = ch. os/exec copies a non-*os.File
+		// stdin on its own goroutine and makes Wait() block until that copy
+		// returns — and it returns only when the client closes the channel.
+		// The client closes it when its own stdin hits EOF, which for
+		// `ssh host cmd` from a terminal or a live pipe is never. So the
+		// command would exit, produce its output, and the session would hang
+		// anyway, until someone thought to add `< /dev/null`. On a rescue box
+		// that is a very bad time to be debugging a hung SSH session.
+		//
+		// StdinPipe has the behaviour we want: Wait closes the pipe once the
+		// process exits, which unblocks the copy below.
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
 			fmt.Fprintf(ch.Stderr(), "exec: %v\n", err)
 			sendExitStatus(ch, 127)
 			return
 		}
+		cmd.Stdout = ch
+		cmd.Stderr = ch.Stderr()
+		if err := cmd.Start(); err != nil {
+			stdin.Close()
+			fmt.Fprintf(ch.Stderr(), "exec: %v\n", err)
+			sendExitStatus(ch, 127)
+			return
+		}
+		go func() {
+			_, _ = io.Copy(stdin, ch)
+			_ = stdin.Close()
+		}()
 		go handleWinCh(reqs, nil)
 	}
 

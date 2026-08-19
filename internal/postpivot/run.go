@@ -96,6 +96,13 @@ func Run(argv []string) int {
 	}
 
 	if cfg != nil && cfg.SSH != nil {
+		// Reprint before starting sshd, not after: the pre-pivot copy of this
+		// banner went to a terminal the pivot has since killed, and if sshd
+		// fails to bind its error lands directly underneath, which is exactly
+		// where an operator hunting for the password will be looking.
+		if cfg.SSH.PasswordGenerated && cfg.SSH.Password != "" {
+			AnnounceSSHPassword(os.Stderr, cfg.SSH.Password, cfg.SSH.Port)
+		}
 		go func() {
 			if err := StartSSHServer(context.Background(), cfg.SSH, tailnet); err != nil {
 				slog.Error("sshd", "err", err)

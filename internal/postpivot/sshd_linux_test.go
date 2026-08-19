@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -199,5 +200,50 @@ func TestParseAuthorizedKeysBadLineReturnsError(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(err.Error()), []byte("line 1")) {
 		t.Errorf("err = %v, want to mention line number", err)
+	}
+}
+
+// `ssh host cmd` must return when the command returns, even though the
+// client's stdin is still open.
+//
+// This is the shape every other test in this file misses. x/crypto/ssh's
+// Session sends channel EOF immediately when Stdin is nil, so sess.Run("true")
+// passes even against a server that deadlocks — and a real client only sends
+// EOF when its own stdin does, which for a command run from a terminal or a
+// live pipe is never. The server used to set cmd.Stdin = ch, which makes
+// os/exec's Wait() block until that copy finishes, i.e. until the client
+// closes the channel, i.e. until after the thing it is blocking. Found by the
+// VM test in nix/tests/lifecycle.nix, which logs in over a real ssh(1).
+func TestSSHExecReturnsWithStdinStillOpen(t *testing.T) {
+	addr := serveSSHTest(t, &SSHConfig{Password: "s3cret"})
+	c := dialClient(t, addr, []ssh.AuthMethod{ssh.Password("s3cret")})
+	sess, err := c.NewSession()
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	defer sess.Close()
+
+	// A stdin that never reaches EOF, the way a terminal behaves. Nothing is
+	// ever written to it; the point is only that it stays open.
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	sess.Stdin = pr
+
+	var out bytes.Buffer
+	sess.Stdout = &out
+
+	done := make(chan error, 1)
+	go func() { done <- sess.Run("echo logged-in") }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if got := strings.TrimSpace(out.String()); got != "logged-in" {
+			t.Errorf("stdout = %q, want %q", got, "logged-in")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("session never returned; the server is waiting on a stdin the client will not close")
 	}
 }

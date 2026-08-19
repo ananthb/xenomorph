@@ -18,8 +18,8 @@
 #
 #   * The guest is booted with `console=ttyS0 console=tty0`, and the last one
 #     wins: /dev/console is the graphics console, which the driver never reads.
-#     wait_for_console_text watches the serial line. Output has to go to
-#     /dev/ttyS0 by name — writing to /dev/console is silence.
+#     The driver watches the serial line, so output has to go to /dev/ttyS0 by
+#     name — writing to /dev/console is silence.
 #
 # The same properties are asserted far more cheaply by the Go tests in
 # internal/postpivot/lifecycle_test.go, which is where a regression will
@@ -54,6 +54,33 @@ let
     networking.firewall.enable = false;
   };
 
+  # Console assertions do NOT go through wait_for_console_text. That method
+  # drains its queue with a single non-blocking get() per retry iteration, and
+  # retry sleeps a second between iterations — one line per second, against a
+  # NixOS boot that emits hundreds. Whether it matches in time is a race with
+  # the backlog: the same call took 33s in one CI run and blew a 180s timeout
+  # in the next, with the text present and correct on the console both times.
+  #
+  # full_console_log has everything since boot and is not consumed by reading
+  # it, so polling it is both faster and deterministic.
+  consoleHelper = ''
+    import re
+    import time
+
+
+    def wait_console(machine, pattern, timeout=180):
+        """Wait for pattern to appear anywhere in the console log; return the match."""
+        for _ in range(timeout):
+            match = re.search(pattern, machine.get_console_log())
+            if match:
+                return match
+            time.sleep(1)
+        raise Exception(
+            f"{pattern!r} never appeared on the console:\\n"
+            + machine.get_console_log()[-4000:]
+        )
+  '';
+
   # Launch a pivot the way an operator does: detached, no terminal, output on
   # the serial console because every other channel goes away with the old root.
   #
@@ -79,15 +106,22 @@ in
   # after the machine that would normally answer questions has stopped
   # existing. Nothing in NixOS listens on 22 here, so the port is xmorph's
   # alone: open means userspace lived through the pivot.
+  #
+  # It also covers the credential half of "reachable". SSH is enabled with no
+  # password and no keys, which is the shape that silently produced a dead
+  # port, so the test reads the generated password off the console exactly as
+  # an operator would and logs in with it.
   idle-stays-up = pkgs.testers.nixosTest {
     name = "xmorph-lifecycle-idle-stays-up";
     nodes = {
       inherit target;
       prober = { ... }: {
-        environment.systemPackages = [ pkgs.netcat-openbsd ];
+        environment.systemPackages = [ pkgs.netcat-openbsd pkgs.openssh pkgs.sshpass ];
       };
     };
     testScript = ''
+      ${consoleHelper}
+
       start_all()
       target.wait_for_unit("multi-user.target")
       prober.wait_for_unit("multi-user.target")
@@ -95,33 +129,71 @@ in
       # Nothing is listening yet — otherwise the assertion below proves nothing.
       prober.fail("nc -z -w 2 target 22")
 
-      # A password, because sshd will not start without one — nothing here
-      # authenticates, the assertion is only that the port answers.
-      target.execute(
-          "${pivotCmd "--entrypoint /usr/local/bin/xmorph --cmd idle --ssh.password=lifecycle-test"}"
-      )
+      # Everything past this point runs against a machine whose backdoor is
+      # about to die, so it all lives in a try/finally. When the script ends
+      # the driver runs execute("sync") on every machine that is_up(), and
+      # execute() calls connect(), which waits on the backdoor shell in a loop
+      # with no way out. On the happy path that is merely wrong; on a failed
+      # assertion it swallows the failure, because the run sits there until
+      # the job timeout and gets scored as a hang instead of the one-line
+      # error that actually explains it. crash() goes through QMP and needs
+      # nothing from the guest, so it works in both cases — but only if it
+      # runs in both cases.
+      try:
+          # No credentials at all. --ssh.enable used to be the trap: sshd
+          # needs a password or a key, got neither, logged it to a console
+          # nobody was reading, and never bound the port. xmorph now
+          # generates one.
+          target.execute(
+              "${pivotCmd "--entrypoint /usr/local/bin/xmorph --cmd idle --ssh.enable"}"
+          )
 
-      # xmorph idle logs this once it is holding the box up.
-      target.wait_for_console_text("serving; no entrypoint to supervise")
+          # xmorph idle logs this once it is holding the box up.
+          wait_console(target, "serving; no entrypoint to supervise")
 
-      # The real assertion, and the only one that distinguishes this from the
-      # incident: someone else can still open a connection to it.
-      prober.wait_until_succeeds("nc -z -w 2 target 22", timeout=120)
+          # The real assertion, and the only one that distinguishes this from
+          # the incident: someone else can still open a connection to it.
+          prober.wait_until_succeeds("nc -z -w 2 target 22", timeout=120)
 
-      # And it has to KEEP holding. A machine that pivots and then reboots
-      # moments later is the loop this design exists to avoid.
-      prober.succeed("sleep 20")
-      prober.succeed("nc -z -w 2 target 22")
+          # A generated password nobody can read is the same failure wearing a
+          # different hat, so take it the way an operator does — off the
+          # console. The banner is printed *before* the "serving" line above,
+          # so this has to search the whole log rather than wait forward.
+          password = wait_console(
+              target,
+              r"generated a root password for it:\s+([a-z]{3,6}-[a-z]{3,6}-[a-z]{3,6})",
+              timeout=60,
+          ).group(1)
 
-      # Pull the plug, and do it here rather than leaving it to the driver.
-      # When the script ends the driver runs execute("sync") on every machine
-      # that is_up(), and execute() calls connect(), which waits on the
-      # backdoor shell in a loop with no way out. The backdoor died with the
-      # old root — that is the premise of this whole test — so the run would
-      # sit there until the global timeout and be scored as a failure with
-      # every assertion already passed. crash() goes through QMP and needs
-      # nothing from the guest.
-      target.crash()
+          # And it has to actually let someone in. Force password auth so a
+          # misconfigured sshd cannot pass this by accepting a key, or by
+          # accepting nothing at all.
+          ssh = (
+              "sshpass -p '{}' ssh -o StrictHostKeyChecking=no "
+              "-o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password "
+              "-o PubkeyAuthentication=no -o ConnectTimeout=10 -o NumberOfPasswordPrompts=1 "
+              "root@target {}"
+          )
+          out = prober.wait_until_succeeds(
+              ssh.format(password, "'echo logged-in'"), timeout=90
+          )
+          assert "logged-in" in out, out
+
+          # An sshd that accepts every password would have passed the line
+          # above.
+          prober.fail(ssh.format("not-the-password", "true"), timeout=60)
+
+          # And it has to KEEP holding. A machine that pivots and then reboots
+          # moments later is the loop this design exists to avoid.
+          prober.succeed("sleep 20")
+          prober.succeed("nc -z -w 2 target 22")
+      finally:
+          # Best-effort: if the guest already died the point is moot, and an
+          # exception here would mask the real one.
+          try:
+              target.crash()
+          except Exception as e:  # noqa: BLE001
+              print(f"target.crash() failed, continuing: {e}")
     '';
   };
 
@@ -136,6 +208,8 @@ in
     name = "xmorph-lifecycle-exit-reboots";
     nodes.target = target;
     testScript = ''
+      ${consoleHelper}
+
       target.start(allow_reboot=True)
       target.wait_for_unit("multi-user.target")
       first_boot = target.succeed("cat /proc/sys/kernel/random/boot_id").strip()
@@ -145,19 +219,32 @@ in
       # which is what turned a stumble into a box needing physical access.
       target.execute("${pivotCmd "--entrypoint /bin/true"}")
 
-      target.wait_for_console_text("no userspace left, rebooting")
+      # If the reboot never happens, the machine sits pivoted with a dead
+      # backdoor, and the driver's end-of-script execute("sync") waits on it
+      # forever — turning a legible assertion failure into a job timeout.
+      # crash() goes through QMP and works without the guest. Only on the
+      # failure path: when the reboot does happen the backdoor comes back and
+      # the driver can shut down normally.
+      try:
+          wait_console(target, "no userspace left, rebooting")
 
-      # The backdoor went down with the old root; the reboot brings a new one.
-      target.connected = False
-      target.wait_for_unit("multi-user.target")
+          # The backdoor went down with the old root; the reboot brings a new one.
+          target.connected = False
+          target.wait_for_unit("multi-user.target")
 
-      second_boot = target.succeed("cat /proc/sys/kernel/random/boot_id").strip()
-      assert first_boot != second_boot, (
-          f"boot_id unchanged ({first_boot}); the machine never actually rebooted"
-      )
+          second_boot = target.succeed("cat /proc/sys/kernel/random/boot_id").strip()
+          assert first_boot != second_boot, (
+              f"boot_id unchanged ({first_boot}); the machine never actually rebooted"
+          )
 
-      # Back on the real OS, not still in the pivoted rootfs.
-      target.succeed("test -d /nix/store")
+          # Back on the real OS, not still in the pivoted rootfs.
+          target.succeed("test -d /nix/store")
+      except Exception:
+          try:
+              target.crash()
+          except Exception as e:  # noqa: BLE001
+              print(f"target.crash() failed, continuing: {e}")
+          raise
     '';
   };
 

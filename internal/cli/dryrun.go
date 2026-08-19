@@ -89,8 +89,14 @@ func printDryRun(w io.Writer, cfg *config.Config) {
 		if cfg.SSHAuthorizedKeys != "" {
 			fmt.Fprintf(w, "     - Auth: public key (%d configured)\n", strings.Count(strings.TrimSpace(cfg.SSHAuthorizedKeys), "\n")+1)
 		}
-		if cfg.SSHPassword != "" {
+		switch {
+		case cfg.SSHPassword != "":
 			fmt.Fprintf(w, "     - Auth: password\n")
+		case cfg.SSHAuthorizedKeys == "":
+			// Nothing was supplied, so the real run would generate one.
+			// Don't generate it here: a dry run must not print a credential
+			// that will never be the credential.
+			fmt.Fprintf(w, "     - Auth: password (generated at pivot time, printed to the console)\n")
 		}
 	}
 
