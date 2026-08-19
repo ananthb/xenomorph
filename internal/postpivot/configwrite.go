@@ -45,9 +45,15 @@ type Config struct {
 
 // SSHConfig describes the in-rootfs SSH setup (dropbear for now).
 type SSHConfig struct {
-	Port           int    `json:"port"`
-	Password       string `json:"password,omitempty"`
-	AuthorizedKeys string `json:"authorized_keys,omitempty"`
+	Port     int    `json:"port"`
+	Password string `json:"password,omitempty"`
+	// PasswordGenerated means xmorph invented Password because the operator
+	// enabled SSH without supplying any credentials. Run reprints it on the
+	// console after the pivot; see AnnounceSSHPassword for why that is worth
+	// doing and why an operator-supplied password never gets the same
+	// treatment.
+	PasswordGenerated bool   `json:"password_generated,omitempty"`
+	AuthorizedKeys    string `json:"authorized_keys,omitempty"`
 }
 
 // TSConfig is the legacy tailscale-via-image schema. Under tsnet we

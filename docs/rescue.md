@@ -173,8 +173,41 @@ The `--ssh.enable` path stands up a small pure-Go OpenSSH server inside
 the pivoted rootfs on the given port (default 22) with an ephemeral
 ed25519 host key. Auth is public-key (from `--ssh.authorized-keys`,
 standard `authorized_keys` format, one per line) and/or password
-(`--ssh.password`); at least one must be configured. Sessions run
-`/bin/sh` as root — the rescue rootfs has no user database.
+(`--ssh.password`). Sessions run `/bin/sh` as root — the rescue rootfs
+has no user database.
+
+Give it neither and xmorph generates a root password: three random words
+from the EFF short wordlist, joined by hyphens, printed as a banner both
+before the pivot and again after it.
+
+```
+  ============================================================
+  SSH is enabled and no credentials were given, so xmorph
+  generated a root password for it:
+
+      swan-pesky-tofu
+
+  Log in with:  ssh -p 22 root@<this machine>
+  Write it down. Nothing keeps a copy you can read later.
+  ============================================================
+```
+
+It is printed twice on purpose. The first copy goes to the terminal you
+ran `xmorph pivot` from, which is usually the SSH session the pivot is
+about to kill; the second goes to the console after the pivot, where a
+serial line will still have it.
+
+| | |
+|---|---|
+| Strength | ~31 bits — three words from a 1295-word list |
+| Good for | the minutes-to-hours a rescue lasts, against online guessing |
+| Not good for | a box left facing the open internet; use `--ssh.authorized-keys` |
+| Where it ends up | the console, and `xmorph.log` under `--log-persist-path` |
+
+A password you pass yourself is never printed and never logged — it may
+be one you use elsewhere, so xmorph treats it as yours. Only the
+generated one, which is worthless anywhere else and useless if you
+cannot read it, goes to the console.
 
 It assumes the network already works: your machine's interface stays
 up across the pivot, but if the broken OS had odd routing or firewall

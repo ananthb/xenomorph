@@ -87,10 +87,11 @@ func bindSSH(fs *pflag.FlagSet, cfg *Config) {
 	fs.Var(&tristateBool{dst: &cfg.SSHEnable}, "ssh.enable", "enable SSH in the new rootfs (auto when other ssh.* set)")
 	fs.Lookup("ssh.enable").NoOptDefVal = "true"
 	fs.Var(&tristateUint16{dst: &cfg.SSHPort}, "ssh.port", "SSH listen port (default 22)")
-	// No default is generated: sshd needs one of these two or it will not
-	// start, and the pivot is refused up front rather than leaving an
-	// unreachable machine behind (see checkSSHUsable).
-	fs.StringVar(&cfg.SSHPassword, "ssh.password", "", "root password (required unless ssh.authorized-keys is set)")
+	// Empty means "generate one", not "no password" — sshd needs a password
+	// or a key or it will not start, and a pivot that silently leaves an
+	// unreachable machine behind is the failure this whole path exists to
+	// avoid. See ensureSSHUsable.
+	fs.StringVar(&cfg.SSHPassword, "ssh.password", "", "root password (default: three random words, printed before and after the pivot)")
 	fs.StringVar(&cfg.SSHAuthorizedKeys, "ssh.authorized-keys", "", "authorized public keys (inline)")
 }
 

@@ -79,15 +79,22 @@ in
   # after the machine that would normally answer questions has stopped
   # existing. Nothing in NixOS listens on 22 here, so the port is xmorph's
   # alone: open means userspace lived through the pivot.
+  #
+  # It also covers the credential half of "reachable". SSH is enabled with no
+  # password and no keys, which is the shape that silently produced a dead
+  # port, so the test reads the generated password off the console exactly as
+  # an operator would and logs in with it.
   idle-stays-up = pkgs.testers.nixosTest {
     name = "xmorph-lifecycle-idle-stays-up";
     nodes = {
       inherit target;
       prober = { ... }: {
-        environment.systemPackages = [ pkgs.netcat-openbsd ];
+        environment.systemPackages = [ pkgs.netcat-openbsd pkgs.openssh pkgs.sshpass ];
       };
     };
     testScript = ''
+      import re
+
       start_all()
       target.wait_for_unit("multi-user.target")
       prober.wait_for_unit("multi-user.target")
@@ -95,10 +102,11 @@ in
       # Nothing is listening yet — otherwise the assertion below proves nothing.
       prober.fail("nc -z -w 2 target 22")
 
-      # A password, because sshd will not start without one — nothing here
-      # authenticates, the assertion is only that the port answers.
+      # No credentials at all. --ssh.enable used to be the trap: sshd needs a
+      # password or a key, got neither, logged it to a console nobody was
+      # reading, and never bound the port. xmorph now generates one.
       target.execute(
-          "${pivotCmd "--entrypoint /usr/local/bin/xmorph --cmd idle --ssh.password=lifecycle-test"}"
+          "${pivotCmd "--entrypoint /usr/local/bin/xmorph --cmd idle --ssh.enable"}"
       )
 
       # xmorph idle logs this once it is holding the box up.
@@ -107,6 +115,29 @@ in
       # The real assertion, and the only one that distinguishes this from the
       # incident: someone else can still open a connection to it.
       prober.wait_until_succeeds("nc -z -w 2 target 22", timeout=120)
+
+      # A generated password nobody can read is the same failure wearing a
+      # different hat, so take it the way an operator does — off the console.
+      target.wait_for_console_text("generated a root password")
+      match = re.search(
+          r"generated a root password for it:\s+([a-z]{3,6}-[a-z]{3,6}-[a-z]{3,6})",
+          target.get_console_log(),
+      )
+      assert match, "no password banner on the console:\n" + target.get_console_log()[-4000:]
+      password = match.group(1)
+
+      # And it has to actually let someone in. Force password auth so a
+      # misconfigured sshd cannot pass this by accepting anything.
+      ssh = (
+          "sshpass -p '{}' ssh -o StrictHostKeyChecking=no "
+          "-o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password "
+          "-o PubkeyAuthentication=no -o ConnectTimeout=10 root@target {}"
+      )
+      out = prober.wait_until_succeeds(ssh.format(password, "'echo logged-in'"), timeout=60)
+      assert "logged-in" in out, out
+
+      # An sshd that accepts every password would have passed the line above.
+      prober.fail(ssh.format("not-the-password", "true"))
 
       # And it has to KEEP holding. A machine that pivots and then reboots
       # moments later is the loop this design exists to avoid.

@@ -129,6 +129,13 @@ type Config struct {
 	SSHPort           *uint16
 	SSHPassword       string
 	SSHAuthorizedKeys string
+	// SSHPasswordGenerated records that xmorph invented SSHPassword rather
+	// than the operator supplying it. It decides one thing: whether the
+	// password is safe to print on the post-pivot console. A password the
+	// operator chose is theirs and may be reused elsewhere, so it stays off
+	// the console; one we generated is worthless anywhere else and useless
+	// unless they can read it.
+	SSHPasswordGenerated bool
 
 	// Tailscale: tri-state Enable (nil = auto from authkey set).
 	TailscaleEnable  *bool
