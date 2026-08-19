@@ -94,6 +94,7 @@ in
     };
     testScript = ''
       import re
+      import time
 
       start_all()
       target.wait_for_unit("multi-user.target")
@@ -102,57 +103,85 @@ in
       # Nothing is listening yet — otherwise the assertion below proves nothing.
       prober.fail("nc -z -w 2 target 22")
 
-      # No credentials at all. --ssh.enable used to be the trap: sshd needs a
-      # password or a key, got neither, logged it to a console nobody was
-      # reading, and never bound the port. xmorph now generates one.
-      target.execute(
-          "${pivotCmd "--entrypoint /usr/local/bin/xmorph --cmd idle --ssh.enable"}"
-      )
+      # Everything past this point runs against a machine whose backdoor is
+      # about to die, so it all lives in a try/finally. When the script ends
+      # the driver runs execute("sync") on every machine that is_up(), and
+      # execute() calls connect(), which waits on the backdoor shell in a loop
+      # with no way out. On the happy path that is merely wrong; on a failed
+      # assertion it swallows the failure, because the run sits there until
+      # the job timeout and gets scored as a hang instead of the one-line
+      # error that actually explains it. crash() goes through QMP and needs
+      # nothing from the guest, so it works in both cases — but only if it
+      # runs in both cases.
+      try:
+          # No credentials at all. --ssh.enable used to be the trap: sshd
+          # needs a password or a key, got neither, logged it to a console
+          # nobody was reading, and never bound the port. xmorph now
+          # generates one.
+          target.execute(
+              "${pivotCmd "--entrypoint /usr/local/bin/xmorph --cmd idle --ssh.enable"}"
+          )
 
-      # xmorph idle logs this once it is holding the box up.
-      target.wait_for_console_text("serving; no entrypoint to supervise")
+          # xmorph idle logs this once it is holding the box up.
+          target.wait_for_console_text("serving; no entrypoint to supervise", timeout=180)
 
-      # The real assertion, and the only one that distinguishes this from the
-      # incident: someone else can still open a connection to it.
-      prober.wait_until_succeeds("nc -z -w 2 target 22", timeout=120)
+          # The real assertion, and the only one that distinguishes this from
+          # the incident: someone else can still open a connection to it.
+          prober.wait_until_succeeds("nc -z -w 2 target 22", timeout=120)
 
-      # A generated password nobody can read is the same failure wearing a
-      # different hat, so take it the way an operator does — off the console.
-      target.wait_for_console_text("generated a root password")
-      match = re.search(
-          r"generated a root password for it:\s+([a-z]{3,6}-[a-z]{3,6}-[a-z]{3,6})",
-          target.get_console_log(),
-      )
-      assert match, "no password banner on the console:\n" + target.get_console_log()[-4000:]
-      password = match.group(1)
+          # A generated password nobody can read is the same failure wearing a
+          # different hat, so take it the way an operator does — off the
+          # console.
+          #
+          # Not wait_for_console_text: that reads forward from a queue, and
+          # the banner is printed *before* the "serving" line above, so by now
+          # it is already in the past and waiting for it hangs until the
+          # timeout. get_console_log() is the whole log since boot, which is
+          # where it actually is. Poll it, so this does not depend on the
+          # order xmorph happens to log things in.
+          password = None
+          for _ in range(60):
+              match = re.search(
+                  r"generated a root password for it:\s+([a-z]{3,6}-[a-z]{3,6}-[a-z]{3,6})",
+                  target.get_console_log(),
+              )
+              if match:
+                  password = match.group(1)
+                  break
+              time.sleep(1)
+          assert password, (
+              "no password on the console:\n" + target.get_console_log()[-4000:]
+          )
 
-      # And it has to actually let someone in. Force password auth so a
-      # misconfigured sshd cannot pass this by accepting anything.
-      ssh = (
-          "sshpass -p '{}' ssh -o StrictHostKeyChecking=no "
-          "-o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password "
-          "-o PubkeyAuthentication=no -o ConnectTimeout=10 root@target {}"
-      )
-      out = prober.wait_until_succeeds(ssh.format(password, "'echo logged-in'"), timeout=60)
-      assert "logged-in" in out, out
+          # And it has to actually let someone in. Force password auth so a
+          # misconfigured sshd cannot pass this by accepting a key, or by
+          # accepting nothing at all.
+          ssh = (
+              "sshpass -p '{}' ssh -o StrictHostKeyChecking=no "
+              "-o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password "
+              "-o PubkeyAuthentication=no -o ConnectTimeout=10 -o NumberOfPasswordPrompts=1 "
+              "root@target {}"
+          )
+          out = prober.wait_until_succeeds(
+              ssh.format(password, "'echo logged-in'"), timeout=90
+          )
+          assert "logged-in" in out, out
 
-      # An sshd that accepts every password would have passed the line above.
-      prober.fail(ssh.format("not-the-password", "true"))
+          # An sshd that accepts every password would have passed the line
+          # above.
+          prober.fail(ssh.format("not-the-password", "true"), timeout=60)
 
-      # And it has to KEEP holding. A machine that pivots and then reboots
-      # moments later is the loop this design exists to avoid.
-      prober.succeed("sleep 20")
-      prober.succeed("nc -z -w 2 target 22")
-
-      # Pull the plug, and do it here rather than leaving it to the driver.
-      # When the script ends the driver runs execute("sync") on every machine
-      # that is_up(), and execute() calls connect(), which waits on the
-      # backdoor shell in a loop with no way out. The backdoor died with the
-      # old root — that is the premise of this whole test — so the run would
-      # sit there until the global timeout and be scored as a failure with
-      # every assertion already passed. crash() goes through QMP and needs
-      # nothing from the guest.
-      target.crash()
+          # And it has to KEEP holding. A machine that pivots and then reboots
+          # moments later is the loop this design exists to avoid.
+          prober.succeed("sleep 20")
+          prober.succeed("nc -z -w 2 target 22")
+      finally:
+          # Best-effort: if the guest already died the point is moot, and an
+          # exception here would mask the real one.
+          try:
+              target.crash()
+          except Exception as e:  # noqa: BLE001
+              print(f"target.crash() failed, continuing: {e}")
     '';
   };
 
@@ -176,19 +205,32 @@ in
       # which is what turned a stumble into a box needing physical access.
       target.execute("${pivotCmd "--entrypoint /bin/true"}")
 
-      target.wait_for_console_text("no userspace left, rebooting")
+      # If the reboot never happens, the machine sits pivoted with a dead
+      # backdoor, and the driver's end-of-script execute("sync") waits on it
+      # forever — turning a legible assertion failure into a job timeout.
+      # crash() goes through QMP and works without the guest. Only on the
+      # failure path: when the reboot does happen the backdoor comes back and
+      # the driver can shut down normally.
+      try:
+          target.wait_for_console_text("no userspace left, rebooting", timeout=180)
 
-      # The backdoor went down with the old root; the reboot brings a new one.
-      target.connected = False
-      target.wait_for_unit("multi-user.target")
+          # The backdoor went down with the old root; the reboot brings a new one.
+          target.connected = False
+          target.wait_for_unit("multi-user.target")
 
-      second_boot = target.succeed("cat /proc/sys/kernel/random/boot_id").strip()
-      assert first_boot != second_boot, (
-          f"boot_id unchanged ({first_boot}); the machine never actually rebooted"
-      )
+          second_boot = target.succeed("cat /proc/sys/kernel/random/boot_id").strip()
+          assert first_boot != second_boot, (
+              f"boot_id unchanged ({first_boot}); the machine never actually rebooted"
+          )
 
-      # Back on the real OS, not still in the pivoted rootfs.
-      target.succeed("test -d /nix/store")
+          # Back on the real OS, not still in the pivoted rootfs.
+          target.succeed("test -d /nix/store")
+      except Exception:
+          try:
+              target.crash()
+          except Exception as e:  # noqa: BLE001
+              print(f"target.crash() failed, continuing: {e}")
+          raise
     '';
   };
 
